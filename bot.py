@@ -297,6 +297,15 @@ def get_condition_keyboard(prefix="add"):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def get_schedule_mode_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🕐 Точное время", callback_data="schedule_mode_slots")],
+            [InlineKeyboardButton(text="⏱ Интервал в часах", callback_data="schedule_mode_interval")],
+        ]
+    )
+
+
 def get_edit_keyboard(reminder_id):
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -543,15 +552,7 @@ async def add_pill_time(message: Message, state: FSMContext):
 
         await state.update_data(time_str=time_str)
         await state.set_state(Form.waiting_for_schedule_mode)
-        await message.answer(
-            "Как хотели бы задавать приемы?",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="🕐 Точное время", callback_data="schedule_mode_slots")],
-                    [InlineKeyboardButton(text="⏱ Интервал в часах", callback_data="schedule_mode_interval")],
-                ]
-            ),
-        )
+        await message.answer("Как хотели бы задавать приемы?", reply_markup=get_schedule_mode_keyboard())
     except Exception:
         logging.exception("Ошибка при подготовке условия для напоминания")
         await state.clear()
@@ -672,60 +673,73 @@ async def handle_condition_choice(callback: CallbackQuery, state: FSMContext):
     condition_key = parts[2]
     condition_label = get_condition_label(condition_key)
 
-    if action == "add":
-        user_data = await state.get_data()
-        user_id = callback.from_user.id
-        tz_name = get_user_tz(user_id)
-        pill_name = str(user_data.get("pill_name", "")).strip()
-        time_str = str(user_data.get("time_str", "")).strip()
-
-        if not pill_name or not time_str:
-            await callback.message.edit_text("⚠️ Данные напоминания потеряны. Попробуйте добавить лекарство заново.")
-            await callback.answer()
-            return
-
-        rem_id = add_reminder(
-            user_id,
-            pill_name,
-            time_str,
-            condition=condition_key,
-            schedule_mode=user_data.get("schedule_mode", "slots"),
-            times_per_day=int(user_data.get("times_per_day", 1) or 1),
-            interval_hours=float(user_data.get("interval_hours", 0) or 0),
-            first_time=str(user_data.get("first_time", "") or ""),
-            time_slots=str(user_data.get("time_slots", "") or ""),
-        )
-        schedule_reminder(user_id, pill_name, time_str, rem_id, tz_name)
-
-        await state.clear()
-        tz_label = get_tz_label(tz_name)
-        await callback.answer()
-        await callback.message.edit_text(
-            f"✅ Добавлено регулярное напоминание:\n💊 <b>{html_escape(pill_name)}</b>\n⏰ <b>{time_str}</b>\n🥗 <b>{html_escape(condition_label)}</b> ({tz_label})",
-            parse_mode="HTML",
-        )
-        await callback.message.answer("Готово.", reply_markup=get_main_menu())
-        return
-
-    if action == "edit":
-        edit_id = (await state.get_data()).get("edit_reminder_id")
-        if edit_id is None:
-            await callback.message.edit_text("⚠️ Нет активного редактирования.")
-            await callback.answer()
-            return
-        update_reminder(edit_id, condition=condition_key)
-        reminder = get_reminder_by_id(edit_id)
-        if reminder:
-            user_id, pill_name, time_str, _ = reminder
+    try:
+        if action == "add":
+            user_data = await state.get_data()
+            user_id = callback.from_user.id
             tz_name = get_user_tz(user_id)
-            schedule_reminder(user_id, pill_name, time_str, edit_id, tz_name)
-        await state.clear()
-        await callback.answer()
-        await callback.message.edit_text(f"✅ Условие обновлено: <b>{html_escape(condition_label)}</b>", parse_mode="HTML")
-        await callback.message.answer("Готово.", reply_markup=get_main_menu())
-        return
+            pill_name = str(user_data.get("pill_name", "")).strip()
+            time_str = str(user_data.get("time_str", "")).strip()
 
-    await callback.answer("⚠️ Неверный тип условия.", show_alert=True)
+            if not pill_name or not time_str:
+                await callback.message.edit_text("⚠️ Данные напоминания потеряны. Попробуйте добавить лекарство заново.")
+                await callback.answer()
+                return
+
+            rem_id = add_reminder(
+                user_id,
+                pill_name,
+                time_str,
+                condition=condition_key,
+                schedule_mode=user_data.get("schedule_mode", "slots"),
+                times_per_day=int(user_data.get("times_per_day", 1) or 1),
+                interval_hours=float(user_data.get("interval_hours", 0) or 0),
+                first_time=str(user_data.get("first_time", "") or ""),
+                time_slots=str(user_data.get("time_slots", "") or ""),
+            )
+            schedule_reminder(user_id, pill_name, time_str, rem_id, tz_name)
+
+            await state.clear()
+            tz_label = get_tz_label(tz_name)
+            summary = (
+                "✅ Напоминание добавлено\n"
+                f"💊 <b>{html_escape(pill_name)}</b>\n"
+                f"⏰ <b>{time_str}</b>\n"
+                f"🥗 <b>{html_escape(condition_label)}</b>\n"
+                f"🕒 {tz_label}"
+            )
+            await callback.answer()
+            await callback.message.edit_text(summary, parse_mode="HTML")
+            await callback.message.answer("Главное меню", reply_markup=get_main_menu())
+            return
+
+        if action == "edit":
+            edit_id = (await state.get_data()).get("edit_reminder_id")
+            if edit_id is None:
+                await callback.message.edit_text("⚠️ Нет активного редактирования.")
+                await callback.answer()
+                return
+
+            update_reminder(edit_id, condition=condition_key)
+            reminder = get_reminder_by_id(edit_id)
+            if reminder:
+                user_id, pill_name, time_str, _ = reminder
+                tz_name = get_user_tz(user_id)
+                schedule_reminder(user_id, pill_name, time_str, edit_id, tz_name)
+
+            await state.clear()
+            await callback.answer()
+            await callback.message.edit_text(
+                f"✅ Условие обновлено: <b>{html_escape(condition_label)}</b>",
+                parse_mode="HTML",
+            )
+            await callback.message.answer("Главное меню", reply_markup=get_main_menu())
+            return
+
+        await callback.answer("⚠️ Неверный тип условия.", show_alert=True)
+    except Exception:
+        logging.exception("Ошибка при обработке выбора условия")
+        await callback.answer("⚠️ Ошибка при сохранении условия.", show_alert=True)
 
 
 @dp.message(F.text == "📋 Мои лекарства")
@@ -919,7 +933,7 @@ async def handle_math_answer(message: Message):
             payload["solved"] = True
             del PENDING_MATH_QUIZ[reminder_id]
             if scheduler.get_job(f"quiz_{reminder_id}"):
-                scheduler.remove_job(f"quiz_{reminder_id}")
+                scheduler.remove_job(f"quiz_{rem_id}")
             await message.answer(
                 f"✅ Верно! {payload['pill_name']} принят(а)?",
                 reply_markup=InlineKeyboardMarkup(
@@ -938,9 +952,8 @@ async def delete_reminder(callback: CallbackQuery):
     delete_reminder_db(rem_id)
 
     for prefix in ("rem_", "delay_", "quiz_"):
-        job_prefix = f"{prefix}{rem_id}"
-        for job in scheduler.get_jobs():
-            if job.id.startswith(job_prefix):
+        for job in list(scheduler.get_jobs()):
+            if job.id.startswith(f"{prefix}{rem_id}"):
                 scheduler.remove_job(job.id)
 
     await callback.message.edit_text("❌ Напоминание полностью удалено из вашего графика.")
