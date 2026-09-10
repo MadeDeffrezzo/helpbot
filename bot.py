@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import sqlite3
 from datetime import datetime, timedelta
 import pytz
@@ -19,8 +20,8 @@ from aiogram.types import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ================= НАСТРОЙКА =================
-TOKEN = "8958134225:AAHrehK6tYrg1t044_FjWWQSaM2jAfrEWUg"  # <-- ВСТАВЬТЕ СЮДА СВОЙ ТОКЕН
+# ================= НАСТРОЙКА И БЕЗОПАСНОСТЬ =================
+TOKEN = os.getenv("BOT_TOKEN", "8958134225:AAHrehK6tYrg1t044_FjWWQSaM2jAfrEWUg") 
 DB_NAME = "pill_reminder.db"
 
 logging.basicConfig(level=logging.INFO)
@@ -106,6 +107,14 @@ def get_user_reminders(user_id):
         return cursor.fetchall()
 
 
+def get_reminder_by_id(reminder_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, pill_name, time_str FROM reminders WHERE id = ?", (reminder_id,))
+        row = cursor.fetchone()
+        return row if row else None
+
+
 def delete_reminder_db(reminder_id):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
@@ -137,28 +146,28 @@ def get_tz_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# ================= ОТПРАВКА НАПОМИНАНИЙ =================
+# ================= ПЛАНИРОВАНИЕ ЗАДАЧ =================
 async def send_pill_reminder(user_id: int, pill_name: str, reminder_id: int):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id FROM reminders WHERE id = ?", (reminder_id,))
         if not cursor.fetchone():
-            return
+            return 
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Принял(а)", callback_data=f"done_{reminder_id}"),
-                InlineKeyboardButton(text="⏰ Через 10 мин", callback_data=f"delay_{reminder_id}_{pill_name}"),
+                InlineKeyboardButton(text="⏰ Через 10 мин", callback_data=f"delay_{reminder_id}"),
             ]
         ]
     )
     try:
         await bot.send_message(
-            user_id, f"🔔 Время принять лекарство: <b>{html.escape(pill_name)}</b>!", reply_markup=kb
+            user_id, f"🔔 Время принять лекарство: <b>{html.escape(pill_name)}</b>!", reply_markup=kb, parse_mode="HTML"
         )
     except Exception as e:
-        logging.error(f"Ошибка отправки сообщения пользователю {user_id}: {e}")
+        logging.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
 
 
 def schedule_reminder(user_id, pill_name, time_str, reminder_id, tz_name):
@@ -177,17 +186,20 @@ def schedule_reminder(user_id, pill_name, time_str, reminder_id, tz_name):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
 
+        utc_datetime = job_datetime.astimezone(pytz.utc)
+
         scheduler.add_job(
             send_pill_reminder,
             "cron",
-            hour=job_datetime.astimezone(pytz.utc).hour,
-            minute=job_datetime.astimezone(pytz.utc).minute,
+            hour=utc_datetime.hour,
+            minute=utc_datetime.minute,
             args=[user_id, pill_name, reminder_id],
             id=job_id,
             replace_existing=True,
         )
+        logging.info(f"Добавлена задача {job_id} на {time_str} ({tz_name})")
     except Exception as e:
-        logging.error(f"Ошибка планирования: {e}")
+        logging.error(f"Ошибка калибровки времени задачи: {e}")
 
 
 def restart_all_reminders():
@@ -204,16 +216,16 @@ def restart_all_reminders():
         for row in rows:
             rem_id, u_id, name, t_str, tz = row
             schedule_reminder(u_id, name, t_str, rem_id, tz)
-    logging.info("Все напоминания успешно перезапущены.")
+    logging.info(f"Успешно восстановлено задач из базы: {len(rows)}")
 
 
-# ================= ХЕНДЛЕРЫ =================
+# ================= ОБРАБОТЧИКИ КОМАНД И КНОПОК =================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     init_db()
     await message.answer(
-        "Привет! Я бот-напоминалка о приеме лекарств. 💊\n\n"
-        "Для корректной работы выберите, пожалуйста, ваш часовой пояс из списка ниже:",
+        "Привет! Я надежный бот-напоминалка о приеме лекарств. 💊\n\n"
+        "Пожалуйста, выберите ваш **часовой пояс** для точной отправки уведомлений:",
         reply_markup=get_tz_keyboard(),
     )
 
@@ -224,33 +236,33 @@ async def select_timezone(callback: CallbackQuery):
     label, tz_name = RU_TIMEZONES[tz_code]
     set_user_tz(callback.from_user.id, tz_name)
 
-    await callback.message.edit_text(f"✅ Выбран часовой пояс: {label}")
+    await callback.message.edit_text(f"✅ Успешно установлен часовой пояс:\n<b>{label}</b>", parse_mode="HTML")
     await callback.message.answer(
-        "Теперь вы можете использовать меню для управления напоминаниями.", reply_markup=get_main_menu()
+        "Вы можете добавлять лекарства и настраивать график через меню ниже.", reply_markup=get_main_menu()
     )
     await callback.answer()
 
 
 @dp.message(F.text == "⚙️ Настройки")
 async def cmd_settings(message: Message):
-    await message.answer("Выберите ваш часовой пояс для настройки времени:", reply_markup=get_tz_keyboard())
+    await message.answer("Выберите ваш актуальный часовой пояс России:", reply_markup=get_tz_keyboard())
 
 
 @dp.message(F.text == "💊 Добавить лекарство")
 async def add_pill_start(message: Message, state: FSMContext):
     tz = get_user_tz(message.from_user.id)
     if not tz:
-        await message.answer("Сначала выберите часовой пояс в настройках ⚙️")
+        await message.answer("⚠️ Сначала укажите ваш часовой пояс в разделе ⚙️ Настройки")
         return
     await state.set_state(Form.waiting_for_pill_name)
-    await message.answer("Введите название лекарства (например: Но-шпа):")
+    await message.answer("Введите точное название лекарства (например: Ибупрофен):")
 
 
 @dp.message(Form.waiting_for_pill_name)
 async def add_pill_name(message: Message, state: FSMContext):
     await state.update_data(pill_name=message.text)
     await state.set_state(Form.waiting_for_time)
-    await message.answer("Введите время приема в формате ЧЧ:ММ (например: 08:30 или 21:00):")
+    await message.answer("Укажите время приема в формате **ЧЧ:ММ** (например: 08:00 или 22:45):")
 
 
 @dp.message(Form.waiting_for_time)
@@ -259,7 +271,7 @@ async def add_pill_time(message: Message, state: FSMContext):
     try:
         datetime.strptime(time_str, "%H:%M")
     except ValueError:
-        await message.answer("❌ Неверный формат времени! Пожалуйста, введите время в формате ЧЧ:ММ (например, 14:05):")
+        await message.answer("❌ Некорректный формат времени! Попробуйте еще раз. Пример: 07:15 или 20:00")
         return
 
     user_data = await state.get_data()
@@ -271,22 +283,22 @@ async def add_pill_time(message: Message, state: FSMContext):
     schedule_reminder(user_id, pill_name, time_str, rem_id, tz_name)
 
     await state.clear()
-    await message.answer(f"✅ Напоминание добавлено: {pill_name} в {time_str}.", reply_markup=get_main_menu())
+    await message.answer(f"✅ Добавлено регулярное напоминание:\n💊 <b>{html.escape(pill_name)}</b> в ⏰ <b>{time_str}</b>", reply_markup=get_main_menu(), parse_mode="HTML")
 
 
 @dp.message(F.text == "📋 Мои лекарства")
 async def list_reminders(message: Message):
     reminders = get_user_reminders(message.from_user.id)
     if not reminders:
-        await message.answer("У вас пока нет активных напоминаний.")
+        await message.answer("У вас пока нет активных напоминаний. Нажмите «💊 Добавить лекарство», чтобы создать первое.")
         return
 
-    await message.answer("📋 Ваши напоминания:")
+    await message.answer("📋 **Ваш текущий график приема лекарств:**")
     for rem_id, pill_name, time_str in reminders:
         kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_{rem_id}")]]
+            inline_keyboard=[[InlineKeyboardButton(text="🗑 Удалить из базы", callback_data=f"del_{rem_id}")]]
         )
-        await message.answer(f"💊 <b>{html.escape(pill_name)}</b> — ⏰ {time_str}", reply_markup=kb)
+        await message.answer(f"💊 <b>{html.escape(pill_name)}</b>\n⏰ Время: {time_str}", reply_markup=kb, parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("del_"))
@@ -298,36 +310,46 @@ async def delete_reminder(callback: CallbackQuery):
     if scheduler.get_job(job_id):
         scheduler.remove_job(job_id)
 
-    await callback.message.edit_text("❌ Напоминание удалено.")
+    await callback.message.edit_text("❌ Напоминание полностью удалено из вашего графика.")
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("done_"))
 async def action_done(callback: CallbackQuery):
+    rem_id = int(callback.data.split("_")[1])
+    data = get_reminder_by_id(rem_id)
+    
+    pill_label = f" «{data[1]}»" if data else ""
     now_time = datetime.now().strftime("%H:%M")
-    await callback.message.edit_text(f"✅ Вы приняли лекарство в {now_time}.")
+    
+    await callback.message.edit_text(f"✅ Вы подтвердили прием лекарства{pill_label} в {now_time}.")
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("delay_"))
 async def action_delay(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    rem_id = parts[1]
-    pill_name = parts[2]
-    user_id = callback.from_user.id
-
+    rem_id = int(callback.data.split("_")[1])
+    data = get_reminder_by_id(rem_id)
+    
+    if not data:
+        await callback.message.edit_text("⚠️ Ошибка: Напоминание не найдено.")
+        await callback.answer()
+        return
+        
+    user_id, pill_name, _ = data
     run_time = datetime.now() + timedelta(minutes=10)
-    scheduler.add_job(send_pill_reminder, "date", run_date=run_time, args=[user_id, pill_name, int(rem_id)])
+    
+    scheduler.add_job(send_pill_reminder, "date", run_date=run_time, args=[user_id, pill_name, rem_id])
 
-    await callback.message.edit_text("⏰ Хорошо, я напомню через 10 минут.")
+    await callback.message.edit_text("⏰ График изменен. Бот повторно напомнит через 10 минут.")
     await callback.answer()
 
 
-# ================= ЗАПУСК =================
+# ================= TOЧКА ВХОДА =================
 async def main():
     init_db()
-    restart_all_reminders()
     scheduler.start()
+    restart_all_reminders()
     await dp.start_polling(bot)
 
 
@@ -335,4 +357,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logging.info("Бот остановлен.")
+        logging.info("Бот выключен.")
