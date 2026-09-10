@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import random
 import sqlite3
 from datetime import datetime, timedelta
 from html import escape as html_escape
@@ -63,6 +64,13 @@ CONDITION_OPTIONS = {
     "night": "перед сном",
 }
 
+SCHEDULE_MODES = {
+    "slots": "Точное время",
+    "interval": "Через равные интервалы",
+}
+
+PENDING_MATH_QUIZ = {}
+
 
 def get_condition_label(value):
     if value is None:
@@ -92,16 +100,30 @@ def init_db():
                 user_id INTEGER,
                 pill_name TEXT,
                 time_str TEXT,
-                condition TEXT DEFAULT 'не указано'
+                condition TEXT DEFAULT 'none',
+                schedule_mode TEXT DEFAULT 'slots',
+                times_per_day INTEGER DEFAULT 1,
+                interval_hours REAL DEFAULT 0,
+                first_time TEXT DEFAULT '',
+                time_slots TEXT DEFAULT ''
             )"""
         )
         conn.commit()
 
         cursor.execute("PRAGMA table_info(reminders)")
         columns = {row[1] for row in cursor.fetchall()}
-        if "condition" not in columns:
-            cursor.execute("ALTER TABLE reminders ADD COLUMN condition TEXT DEFAULT 'не указано'")
-            conn.commit()
+        type_map = {
+            "condition": "TEXT DEFAULT 'none'",
+            "schedule_mode": "TEXT DEFAULT 'slots'",
+            "times_per_day": "INTEGER DEFAULT 1",
+            "interval_hours": "REAL DEFAULT 0",
+            "first_time": "TEXT DEFAULT ''",
+            "time_slots": "TEXT DEFAULT ''",
+        }
+        for col_name, column_def in type_map.items():
+            if col_name not in columns:
+                cursor.execute(f"ALTER TABLE reminders ADD COLUMN {col_name} {column_def}")
+        conn.commit()
 
 
 def set_user_tz(user_id, tz_name):
@@ -129,13 +151,39 @@ def get_tz_label(tz_name):
     return tz_name or "UTC"
 
 
-def add_reminder(user_id, pill_name, time_str, condition="none"):
+def add_reminder(
+    user_id,
+    pill_name,
+    time_str,
+    condition="none",
+    schedule_mode="slots",
+    times_per_day=1,
+    interval_hours=0,
+    first_time="",
+    time_slots="",
+):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         normalized = condition if condition in CONDITION_OPTIONS else "none"
         cursor.execute(
-            "INSERT INTO reminders (user_id, pill_name, time_str, condition) VALUES (?, ?, ?, ?)",
-            (user_id, pill_name, time_str, normalized),
+            """
+            INSERT INTO reminders (
+                user_id, pill_name, time_str, condition,
+                schedule_mode, times_per_day, interval_hours,
+                first_time, time_slots
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                pill_name,
+                time_str,
+                normalized,
+                schedule_mode,
+                times_per_day,
+                interval_hours,
+                first_time,
+                time_slots,
+            ),
         )
         conn.commit()
         return cursor.lastrowid
@@ -159,7 +207,17 @@ def get_reminder_by_id(reminder_id):
         return row if row else None
 
 
-def update_reminder(reminder_id, pill_name=None, time_str=None, condition=None):
+def update_reminder(
+    reminder_id,
+    pill_name=None,
+    time_str=None,
+    condition=None,
+    schedule_mode=None,
+    times_per_day=None,
+    interval_hours=None,
+    first_time=None,
+    time_slots=None,
+):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         values = []
@@ -170,6 +228,16 @@ def update_reminder(reminder_id, pill_name=None, time_str=None, condition=None):
         if condition is not None:
             normalized = condition if condition in CONDITION_OPTIONS else "none"
             values.append(("condition", normalized))
+        if schedule_mode is not None:
+            values.append(("schedule_mode", schedule_mode))
+        if times_per_day is not None:
+            values.append(("times_per_day", times_per_day))
+        if interval_hours is not None:
+            values.append(("interval_hours", interval_hours))
+        if first_time is not None:
+            values.append(("first_time", first_time))
+        if time_slots is not None:
+            values.append(("time_slots", time_slots))
         if not values:
             return False
 
@@ -187,11 +255,20 @@ def delete_reminder_db(reminder_id):
         cursor.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
         conn.commit()
 
+    for job_id in list(scheduler.get_jobs()) if hasattr(scheduler, "get_jobs") else []:
+        job_name = job_id.id if hasattr(job_id, "id") else str(job_id)
+        if job_name.startswith(f"rem_{reminder_id}") or job_name.startswith(f"delay_{reminder_id}") or job_name.startswith(f"quiz_{reminder_id}"):
+            scheduler.remove_job(job_name)
+
 
 # ================= СОСТОЯНИЯ (FSM) =================
 class Form(StatesGroup):
     waiting_for_pill_name = State()
     waiting_for_time = State()
+    waiting_for_schedule_mode = State()
+    waiting_for_schedule_count = State()
+    waiting_for_slot_times = State()
+    waiting_for_interval_value = State()
     waiting_for_condition = State()
     waiting_for_new_name = State()
     waiting_for_new_time = State()
@@ -225,6 +302,7 @@ def get_edit_keyboard(reminder_id):
         inline_keyboard=[
             [InlineKeyboardButton(text="✏️ Название", callback_data=f"edit_name_{reminder_id}")],
             [InlineKeyboardButton(text="⏰ Время", callback_data=f"edit_time_{reminder_id}")],
+            [InlineKeyboardButton(text="🕒 Расписание", callback_data=f"edit_schedule_{reminder_id}")],
             [InlineKeyboardButton(text="🥗 Условие", callback_data=f"edit_condition_{reminder_id}")],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_{reminder_id}")],
         ]
@@ -239,7 +317,47 @@ def get_tz_keyboard():
 
 
 # ================= ПЛАНИРОВАНИЕ ЗАДАЧ =================
-async def send_pill_reminder(user_id: int, pill_name: str, reminder_id: int):
+
+def normalize_schedule_reminder(reminder_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT user_id, pill_name, time_str, condition, schedule_mode, times_per_day, interval_hours, first_time, time_slots FROM reminders WHERE id = ?",
+            (reminder_id,),
+        )
+        row = cursor.fetchone()
+    if not row:
+        return []
+
+    user_id, pill_name, time_str, condition, schedule_mode, times_per_day, interval_hours, first_time, time_slots = row
+    times = []
+    mode = (schedule_mode or "slots").strip() or "slots"
+    count = int(times_per_day or 1)
+    if mode == "interval":
+        start_time = first_time or time_str
+        interval = float(interval_hours or 0)
+        if start_time and interval > 0:
+            start_dt = datetime.strptime(start_time, "%H:%M")
+            for i in range(count):
+                times.append((start_dt + timedelta(hours=interval * i)).strftime("%H:%M"))
+        elif time_str:
+            times.append(time_str)
+    else:
+        raw_slots = time_slots or time_str
+        for item in str(raw_slots).split(","):
+            value = item.strip()
+            if value:
+                try:
+                    datetime.strptime(value, "%H:%M")
+                    times.append(value)
+                except ValueError:
+                    continue
+        if not times and time_str:
+            times.append(time_str)
+    return times
+
+
+async def send_smart_reminder(user_id: int, pill_name: str, reminder_id: int):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id, condition FROM reminders WHERE id = ?", (reminder_id,))
@@ -249,23 +367,41 @@ async def send_pill_reminder(user_id: int, pill_name: str, reminder_id: int):
         _, condition = row
 
     condition_text = get_condition_label(condition)
+    a = random.randint(1, 5)
+    b = random.randint(1, 5)
+    answer = a + b
+    PENDING_MATH_QUIZ[reminder_id] = {"user_id": user_id, "pill_name": pill_name, "answer": answer, "solved": False}
+
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Принял(а)", callback_data=f"done_{reminder_id}"),
-                InlineKeyboardButton(text="⏰ Через 10 мин", callback_data=f"delay_{reminder_id}"),
-            ]
+            [InlineKeyboardButton(text="✅ Готово", callback_data=f"done_{reminder_id}")],
+            [InlineKeyboardButton(text="⏰ Напомнить через 5 минут", callback_data=f"delay_{reminder_id}")],
         ]
     )
     try:
         await bot.send_message(
             user_id,
-            f"🔔 Время принять лекарство: <b>{html_escape(pill_name)}</b>\n📌 Условие: <b>{html_escape(condition_text)}</b>",
-            reply_markup=kb,
+            f"🔔 Время принять лекарство: <b>{html_escape(pill_name)}</b>\n📌 Условие: <b>{html_escape(condition_text)}</b>\n\n🧠 Быстрая проверка: <b>{a} + {b}</b> = ?\nНапишите ответ цифрой, либо нажмите кнопку ниже.",
             parse_mode="HTML",
+            reply_markup=kb,
         )
     except Exception as e:
         logging.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
+
+    if scheduler.get_job(f"quiz_{reminder_id}"):
+        scheduler.remove_job(f"quiz_{reminder_id}")
+    scheduler.add_job(
+        send_smart_reminder,
+        "interval",
+        minutes=1,
+        args=[user_id, pill_name, reminder_id],
+        id=f"quiz_{reminder_id}",
+        replace_existing=True,
+    )
+
+
+async def send_pill_reminder(user_id: int, pill_name: str, reminder_id: int):
+    await send_smart_reminder(user_id, pill_name, reminder_id)
 
 
 def schedule_reminder(user_id, pill_name, time_str, reminder_id, tz_name):
@@ -274,32 +410,37 @@ def schedule_reminder(user_id, pill_name, time_str, reminder_id, tz_name):
             logging.warning(f"Не удалось запланировать напоминание {reminder_id}: не задан часовой пояс пользователя {user_id}")
             return
 
+        schedule_rows = normalize_schedule_reminder(reminder_id)
+        if not schedule_rows:
+            schedule_rows = [time_str]
+
         user_tz = pytz.timezone(tz_name)
         now_user = datetime.now(user_tz)
 
-        target_time = datetime.strptime(time_str, "%H:%M").time()
-        job_datetime = datetime.combine(now_user.date(), target_time)
-        job_datetime = user_tz.localize(job_datetime)
+        for idx, slot in enumerate(schedule_rows):
+            target_time = datetime.strptime(slot, "%H:%M").time()
+            job_datetime = datetime.combine(now_user.date(), target_time)
+            job_datetime = user_tz.localize(job_datetime)
 
-        if job_datetime < now_user:
-            job_datetime += timedelta(days=1)
+            if job_datetime < now_user:
+                job_datetime += timedelta(days=1)
 
-        job_id = f"rem_{reminder_id}"
-        if scheduler.get_job(job_id):
-            scheduler.remove_job(job_id)
+            job_id = f"rem_{reminder_id}_{idx}"
+            if scheduler.get_job(job_id):
+                scheduler.remove_job(job_id)
 
-        scheduler.add_job(
-            send_pill_reminder,
-            "cron",
-            hour=job_datetime.hour,
-            minute=job_datetime.minute,
-            second=0,
-            timezone=user_tz,
-            args=[user_id, pill_name, reminder_id],
-            id=job_id,
-            replace_existing=True,
-        )
-        logging.info(f"Добавлена задача {job_id} на {time_str} ({tz_name})")
+            scheduler.add_job(
+                send_pill_reminder,
+                "cron",
+                hour=job_datetime.hour,
+                minute=job_datetime.minute,
+                second=0,
+                timezone=user_tz,
+                args=[user_id, pill_name, reminder_id],
+                id=job_id,
+                replace_existing=True,
+            )
+            logging.info(f"Добавлена задача {job_id} на {slot} ({tz_name})")
     except Exception as e:
         logging.error(f"Ошибка калибровки времени задачи: {e}")
 
@@ -401,12 +542,123 @@ async def add_pill_time(message: Message, state: FSMContext):
             return
 
         await state.update_data(time_str=time_str)
-        await state.set_state(Form.waiting_for_condition)
-        await message.answer("Выберите, когда принимать лекарство:", reply_markup=get_condition_keyboard("add"))
+        await state.set_state(Form.waiting_for_schedule_mode)
+        await message.answer(
+            "Как хотели бы задавать приемы?",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🕐 Точное время", callback_data="schedule_mode_slots")],
+                    [InlineKeyboardButton(text="⏱ Интервал в часах", callback_data="schedule_mode_interval")],
+                ]
+            ),
+        )
     except Exception:
         logging.exception("Ошибка при подготовке условия для напоминания")
         await state.clear()
         await message.answer("⚠️ Не удалось подготовить напоминание. Попробуйте ещё раз с начала.")
+
+
+@dp.callback_query(F.data.startswith("schedule_mode_"))
+async def set_schedule_mode(callback: CallbackQuery, state: FSMContext):
+    mode = callback.data.replace("schedule_mode_", "")
+    await state.update_data(schedule_mode=mode)
+    await state.set_state(Form.waiting_for_schedule_count)
+    await callback.message.edit_text("Сколько раз в день принимать? Введите число от 1 до 6:")
+    await callback.answer()
+
+
+@dp.message(Form.waiting_for_schedule_count)
+async def set_schedule_count(message: Message, state: FSMContext):
+    try:
+        count = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("❌ Введите число от 1 до 6.")
+        return
+    if count < 1 or count > 6:
+        await message.answer("❌ Введите число от 1 до 6.")
+        return
+
+    data = await state.get_data()
+    mode = data.get("schedule_mode", "slots")
+    await state.update_data(times_per_day=count)
+    if mode == "slots":
+        await state.set_state(Form.waiting_for_slot_times)
+        await message.answer("Введите точные времена через запятую, например: 08:00, 13:00, 19:00")
+    else:
+        await state.set_state(Form.waiting_for_interval_value)
+        await message.answer("Введите первый прием и шаг в часах через пробел, например: 08:00 6")
+
+
+@dp.message(Form.waiting_for_slot_times)
+async def set_slot_times(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    slots = []
+    for item in raw.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        try:
+            datetime.strptime(value, "%H:%M")
+            slots.append(value)
+        except ValueError:
+            await message.answer("❌ В одном из времен ошибка. Используйте формат ЧЧ:ММ, например: 08:00, 13:30")
+            return
+
+    data = await state.get_data()
+    count = int(data.get("times_per_day", 1))
+    slots = slots[:count]
+    if len(slots) < count:
+        await message.answer(f"❌ Нужно указать ровно {count} времени(ен) через запятую.")
+        return
+
+    await state.update_data(time_slots=", ".join(slots), schedule_mode="slots")
+    edit_id = data.get("edit_reminder_id")
+    if edit_id is not None:
+        update_reminder(edit_id, schedule_mode="slots", times_per_day=count, time_slots=", ".join(slots))
+        reminder = get_reminder_by_id(edit_id)
+        if reminder:
+            user_id, pill_name, _, _ = reminder
+            schedule_reminder(user_id, pill_name, reminder[2], edit_id, get_user_tz(user_id))
+        await state.clear()
+        await message.answer("✅ Расписание обновлено.", reply_markup=get_main_menu())
+        return
+
+    await state.set_state(Form.waiting_for_condition)
+    await message.answer("Выберите, когда принимать лекарство:", reply_markup=get_condition_keyboard("add"))
+
+
+@dp.message(Form.waiting_for_interval_value)
+async def set_interval_value(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    try:
+        parts = raw.split()
+        if len(parts) != 2:
+            raise ValueError
+        first_time, interval_hours = parts
+        datetime.strptime(first_time, "%H:%M")
+        interval = float(interval_hours)
+        if interval <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Неверный формат. Пример: 08:00 6")
+        return
+
+    data = await state.get_data()
+    count = int(data.get("times_per_day", 1))
+    await state.update_data(first_time=first_time, interval_hours=interval, times_per_day=count, schedule_mode="interval")
+    edit_id = data.get("edit_reminder_id")
+    if edit_id is not None:
+        update_reminder(edit_id, schedule_mode="interval", times_per_day=count, first_time=first_time, interval_hours=interval)
+        reminder = get_reminder_by_id(edit_id)
+        if reminder:
+            user_id, pill_name, _, _ = reminder
+            schedule_reminder(user_id, pill_name, reminder[2], edit_id, get_user_tz(user_id))
+        await state.clear()
+        await message.answer("✅ Расписание обновлено.", reply_markup=get_main_menu())
+        return
+
+    await state.set_state(Form.waiting_for_condition)
+    await message.answer("Выберите, когда принимать лекарство:", reply_markup=get_condition_keyboard("add"))
 
 
 @dp.callback_query(F.data.startswith("cond_"))
@@ -432,7 +684,17 @@ async def handle_condition_choice(callback: CallbackQuery, state: FSMContext):
             await callback.answer()
             return
 
-        rem_id = add_reminder(user_id, pill_name, time_str, condition_key)
+        rem_id = add_reminder(
+            user_id,
+            pill_name,
+            time_str,
+            condition=condition_key,
+            schedule_mode=user_data.get("schedule_mode", "slots"),
+            times_per_day=int(user_data.get("times_per_day", 1) or 1),
+            interval_hours=float(user_data.get("interval_hours", 0) or 0),
+            first_time=str(user_data.get("first_time", "") or ""),
+            time_slots=str(user_data.get("time_slots", "") or ""),
+        )
         schedule_reminder(user_id, pill_name, time_str, rem_id, tz_name)
 
         await state.clear()
@@ -568,27 +830,45 @@ async def edit_condition_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("del_"))
-async def delete_reminder(callback: CallbackQuery):
-    rem_id = int(callback.data.split("_")[1])
-    delete_reminder_db(rem_id)
+@dp.callback_query(F.data.startswith("edit_schedule_"))
+async def edit_schedule_start(callback: CallbackQuery, state: FSMContext):
+    rem_id = int(callback.data.split("_", 2)[2])
+    await state.update_data(edit_reminder_id=rem_id)
+    await callback.message.edit_text(
+        "Выберите режим расписания:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🕐 Точное время", callback_data=f"edit_sched_mode_slots_{rem_id}")],
+                [InlineKeyboardButton(text="⏱ Интервал в часах", callback_data=f"edit_sched_mode_interval_{rem_id}")],
+            ]
+        ),
+    )
+    await callback.answer()
 
-    job_id = f"rem_{rem_id}"
-    if scheduler.get_job(job_id):
-        scheduler.remove_job(job_id)
 
-    await callback.message.edit_text("❌ Напоминание полностью удалено из вашего графика.")
+@dp.callback_query(F.data.startswith("edit_sched_mode_"))
+async def edit_schedule_mode(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    rem_id = int(parts[-1])
+    mode = parts[3]
+    await state.update_data(edit_reminder_id=rem_id, schedule_mode=mode)
+    await state.set_state(Form.waiting_for_schedule_count)
+    await callback.message.edit_text("Введите сколько раз в день принимать лекарство (1-6):")
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("done_"))
 async def action_done(callback: CallbackQuery):
     rem_id = int(callback.data.split("_")[1])
+    if rem_id in PENDING_MATH_QUIZ:
+        PENDING_MATH_QUIZ.pop(rem_id, None)
+        if scheduler.get_job(f"quiz_{rem_id}"):
+            scheduler.remove_job(f"quiz_{rem_id}")
     data = get_reminder_by_id(rem_id)
-    
+
     pill_label = f" «{data[1]}»" if data else ""
     now_time = datetime.now().strftime("%H:%M")
-    
+
     await callback.message.edit_text(f"✅ Вы подтвердили прием лекарства{pill_label} в {now_time}.")
     await callback.answer()
 
@@ -596,6 +876,10 @@ async def action_done(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("delay_"))
 async def action_delay(callback: CallbackQuery):
     rem_id = int(callback.data.split("_")[1])
+    if rem_id in PENDING_MATH_QUIZ:
+        PENDING_MATH_QUIZ.pop(rem_id, None)
+        if scheduler.get_job(f"quiz_{rem_id}"):
+            scheduler.remove_job(f"quiz_{rem_id}")
     data = get_reminder_by_id(rem_id)
 
     if not data:
@@ -606,7 +890,7 @@ async def action_delay(callback: CallbackQuery):
     user_id, pill_name, _, _ = data
     tz_name = get_user_tz(user_id)
     tz = pytz.timezone(tz_name) if tz_name else pytz.utc
-    run_time = datetime.now(tz) + timedelta(minutes=10)
+    run_time = datetime.now(tz) + timedelta(minutes=5)
 
     scheduler.add_job(
         send_pill_reminder,
@@ -617,7 +901,48 @@ async def action_delay(callback: CallbackQuery):
         replace_existing=True,
     )
 
-    await callback.message.edit_text("⏰ График изменен. Бот повторно напомнит через 10 минут.")
+    await callback.message.edit_text("⏰ Напоминание будет повторено через 5 минут.")
+    await callback.answer()
+
+
+@dp.message(F.text)
+async def handle_math_answer(message: Message):
+    for reminder_id, payload in list(PENDING_MATH_QUIZ.items()):
+        if payload.get("user_id") != message.from_user.id:
+            continue
+        try:
+            answer = int((message.text or "").strip())
+        except ValueError:
+            continue
+        if answer == payload.get("answer"):
+            payload["solved"] = True
+            del PENDING_MATH_QUIZ[reminder_id]
+            if scheduler.get_job(f"quiz_{reminder_id}"):
+                scheduler.remove_job(f"quiz_{reminder_id}")
+            await message.answer(
+                f"✅ Верно! {payload['pill_name']} принят(а)?",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="⏰ Напомнить через 5 минут", callback_data=f"delay_{reminder_id}")],
+                        [InlineKeyboardButton(text="✅ Готово", callback_data=f"done_{reminder_id}")],
+                    ]
+                ),
+            )
+            break
+
+
+@dp.callback_query(F.data.startswith("del_"))
+async def delete_reminder(callback: CallbackQuery):
+    rem_id = int(callback.data.split("_")[1])
+    delete_reminder_db(rem_id)
+
+    for prefix in ("rem_", "delay_", "quiz_"):
+        job_prefix = f"{prefix}{rem_id}"
+        for job in scheduler.get_jobs():
+            if job.id.startswith(job_prefix):
+                scheduler.remove_job(job.id)
+
+    await callback.message.edit_text("❌ Напоминание полностью удалено из вашего графика.")
     await callback.answer()
 
 
