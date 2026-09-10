@@ -290,33 +290,42 @@ async def add_pill_name(message: Message, state: FSMContext):
 
 @dp.message(Form.waiting_for_time)
 async def add_pill_time(message: Message, state: FSMContext):
-    time_str = message.text.strip()
+    time_str = (message.text or "").strip()
+    if not time_str:
+        await message.answer("❌ Время не введено. Попробуйте ещё раз в формате ЧЧ:ММ.")
+        return
+
     try:
         datetime.strptime(time_str, "%H:%M")
     except ValueError:
         await message.answer("❌ Некорректный формат времени! Попробуйте еще раз. Пример: 07:15 или 20:00")
         return
 
-    user_data = await state.get_data()
-    pill_name = user_data["pill_name"].strip()
-    if not pill_name:
-        await message.answer("❌ Название лекарства не распознано. Попробуйте добавить лекарство заново.")
+    try:
+        user_data = await state.get_data()
+        pill_name = str(user_data.get("pill_name", "")).strip()
+        if not pill_name:
+            await message.answer("❌ Название лекарства не распознано. Попробуйте добавить лекарство заново.")
+            await state.clear()
+            return
+
+        user_id = message.from_user.id
+        tz_name = get_user_tz(user_id)
+
+        rem_id = add_reminder(user_id, pill_name, time_str)
+        schedule_reminder(user_id, pill_name, time_str, rem_id, tz_name)
+
         await state.clear()
-        return
-
-    user_id = message.from_user.id
-    tz_name = get_user_tz(user_id)
-
-    rem_id = add_reminder(user_id, pill_name, time_str)
-    schedule_reminder(user_id, pill_name, time_str, rem_id, tz_name)
-
-    await state.clear()
-    tz_label = get_tz_label(tz_name)
-    await message.answer(
-        f"✅ Добавлено регулярное напоминание:\n💊 <b>{html.escape(pill_name)}</b>\n⏰ <b>{time_str}</b> ({tz_label})",
-        reply_markup=get_main_menu(),
-        parse_mode="HTML",
-    )
+        tz_label = get_tz_label(tz_name)
+        await message.answer(
+            f"✅ Добавлено регулярное напоминание:\n💊 <b>{html.escape(pill_name)}</b>\n⏰ <b>{time_str}</b> ({tz_label})",
+            reply_markup=get_main_menu(),
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        logging.exception("Ошибка при сохранении напоминания после ввода времени")
+        await state.clear()
+        await message.answer("⚠️ Не удалось сохранить напоминание. Попробуйте ещё раз с начала.")
 
 
 @dp.message(F.text == "📋 Мои лекарства")
