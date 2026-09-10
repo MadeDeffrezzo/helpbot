@@ -64,6 +64,17 @@ CONDITION_OPTIONS = {
 }
 
 
+def get_condition_label(value):
+    if value is None:
+        return "не указано"
+    if value in CONDITION_OPTIONS:
+        return CONDITION_OPTIONS[value]
+    for key, label in CONDITION_OPTIONS.items():
+        if value == label:
+            return label
+    return "не указано"
+
+
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
@@ -118,12 +129,13 @@ def get_tz_label(tz_name):
     return tz_name or "UTC"
 
 
-def add_reminder(user_id, pill_name, time_str, condition="не указано"):
+def add_reminder(user_id, pill_name, time_str, condition="none"):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
+        normalized = condition if condition in CONDITION_OPTIONS else "none"
         cursor.execute(
             "INSERT INTO reminders (user_id, pill_name, time_str, condition) VALUES (?, ?, ?, ?)",
-            (user_id, pill_name, time_str, condition),
+            (user_id, pill_name, time_str, normalized),
         )
         conn.commit()
         return cursor.lastrowid
@@ -156,7 +168,8 @@ def update_reminder(reminder_id, pill_name=None, time_str=None, condition=None):
         if time_str is not None:
             values.append(("time_str", time_str))
         if condition is not None:
-            values.append(("condition", condition))
+            normalized = condition if condition in CONDITION_OPTIONS else "none"
+            values.append(("condition", normalized))
         if not values:
             return False
 
@@ -235,7 +248,7 @@ async def send_pill_reminder(user_id: int, pill_name: str, reminder_id: int):
             return
         _, condition = row
 
-    condition_text = CONDITION_OPTIONS.get(condition, "не указано") if condition else "не указано"
+    condition_text = get_condition_label(condition)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -405,7 +418,7 @@ async def handle_condition_choice(callback: CallbackQuery, state: FSMContext):
 
     action = parts[1]
     condition_key = parts[2]
-    condition_value = CONDITION_OPTIONS.get(condition_key, "не указано")
+    condition_label = get_condition_label(condition_key)
 
     if action == "add":
         user_data = await state.get_data()
@@ -419,17 +432,17 @@ async def handle_condition_choice(callback: CallbackQuery, state: FSMContext):
             await callback.answer()
             return
 
-        rem_id = add_reminder(user_id, pill_name, time_str, condition_value)
+        rem_id = add_reminder(user_id, pill_name, time_str, condition_key)
         schedule_reminder(user_id, pill_name, time_str, rem_id, tz_name)
 
         await state.clear()
         tz_label = get_tz_label(tz_name)
+        await callback.answer()
         await callback.message.edit_text(
-            f"✅ Добавлено регулярное напоминание:\n💊 <b>{html_escape(pill_name)}</b>\n⏰ <b>{time_str}</b>\n🥗 <b>{html_escape(condition_value)}</b> ({tz_label})",
+            f"✅ Добавлено регулярное напоминание:\n💊 <b>{html_escape(pill_name)}</b>\n⏰ <b>{time_str}</b>\n🥗 <b>{html_escape(condition_label)}</b> ({tz_label})",
             parse_mode="HTML",
             reply_markup=get_main_menu(),
         )
-        await callback.answer()
         return
 
     if action == "edit":
@@ -438,15 +451,15 @@ async def handle_condition_choice(callback: CallbackQuery, state: FSMContext):
             await callback.message.edit_text("⚠️ Нет активного редактирования.")
             await callback.answer()
             return
-        update_reminder(edit_id, condition=condition_value)
+        update_reminder(edit_id, condition=condition_key)
         reminder = get_reminder_by_id(edit_id)
         if reminder:
             user_id, pill_name, time_str, _ = reminder
             tz_name = get_user_tz(user_id)
             schedule_reminder(user_id, pill_name, time_str, edit_id, tz_name)
         await state.clear()
-        await callback.message.edit_text(f"✅ Условие обновлено: <b>{html_escape(condition_value)}</b>", parse_mode="HTML", reply_markup=get_main_menu())
         await callback.answer()
+        await callback.message.edit_text(f"✅ Условие обновлено: <b>{html_escape(condition_label)}</b>", parse_mode="HTML", reply_markup=get_main_menu())
         return
 
     await callback.answer("⚠️ Неверный тип условия.", show_alert=True)
@@ -464,7 +477,8 @@ async def list_reminders(message: Message):
     lines = [f"📋 <b>Ваш текущий график приема лекарств</b>", f"⏱️ Часовой пояс: {timezone_label}"]
 
     for rem_id, pill_name, time_str, condition in reminders:
-        lines.append(f"\n💊 <b>{html_escape(pill_name)}</b> — ⏰ {time_str} — 🥗 {html_escape(condition or 'не указано')}")
+        condition_label = get_condition_label(condition)
+        lines.append(f"\n💊 <b>{html_escape(pill_name)}</b> — ⏰ {time_str} — 🥗 {html_escape(condition_label)}")
 
     await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"list_edit_{rem_id}")]
@@ -483,7 +497,8 @@ async def list_edit_trigger(callback: CallbackQuery, state: FSMContext):
 
     await state.update_data(edit_reminder_id=rem_id)
     user_id, pill_name, time_str, condition = reminder
-    text = f"✏️ Что менять у лекарства <b>{html_escape(pill_name)}</b>?\n⏰ Сейчас: {time_str}\n🥗 Условие: {html_escape(condition or 'не указано')}"
+    condition_label = get_condition_label(condition)
+    text = f"✏️ Что менять у лекарства <b>{html_escape(pill_name)}</b>?\n⏰ Сейчас: {time_str}\n🥗 Условие: {html_escape(condition_label)}"
     await callback.message.edit_text(text, reply_markup=get_edit_keyboard(rem_id), parse_mode="HTML")
     await callback.answer()
 
