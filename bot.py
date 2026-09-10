@@ -6,6 +6,9 @@ from datetime import datetime, timedelta
 from html import escape as html_escape
 
 import pytz
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -23,8 +26,11 @@ from aiogram.types import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ================= НАСТРОЙКА И БЕЗОПАСНОСТЬ =================
-TOKEN = os.getenv("BOT_TOKEN", "8958134225:AAHrehK6tYrg1t044_FjWWQSaM2jAfrEWUg") 
-DB_NAME = "pill_reminder.db"
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set. Add it to environment variables or .env")
+
+DB_NAME = os.getenv("DB_NAME", "pill_reminder.db")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
@@ -427,7 +433,7 @@ async def handle_condition_choice(callback: CallbackQuery, state: FSMContext):
         return
 
     if action == "edit":
-        edit_id = await state.get_value("edit_reminder_id")
+        edit_id = (await state.get_data()).get("edit_reminder_id")
         if edit_id is None:
             await callback.message.edit_text("⚠️ Нет активного редактирования.")
             await callback.answer()
@@ -467,7 +473,7 @@ async def list_reminders(message: Message):
 
 
 @dp.callback_query(F.data.startswith("list_edit_"))
-async def list_edit_trigger(callback: CallbackQuery):
+async def list_edit_trigger(callback: CallbackQuery, state: FSMContext):
     rem_id = int(callback.data.split("_", 2)[2])
     reminder = get_reminder_by_id(rem_id)
     if not reminder:
@@ -475,6 +481,7 @@ async def list_edit_trigger(callback: CallbackQuery):
         await callback.answer()
         return
 
+    await state.update_data(edit_reminder_id=rem_id)
     user_id, pill_name, time_str, condition = reminder
     text = f"✏️ Что менять у лекарства <b>{html_escape(pill_name)}</b>?\n⏰ Сейчас: {time_str}\n🥗 Условие: {html_escape(condition or 'не указано')}"
     await callback.message.edit_text(text, reply_markup=get_edit_keyboard(rem_id), parse_mode="HTML")
