@@ -3,9 +3,11 @@ import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta
+from html import escape as html_escape
+
 import pytz
 
-from aiogram import Bot, Dispatcher, F, html
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -171,7 +173,7 @@ async def send_pill_reminder(user_id: int, pill_name: str, reminder_id: int):
     )
     try:
         await bot.send_message(
-            user_id, f"🔔 Время принять лекарство: <b>{html.escape(pill_name)}</b>!", reply_markup=kb, parse_mode="HTML"
+            user_id, f"🔔 Время принять лекарство: <b>{html_escape(pill_name)}</b>!", reply_markup=kb, parse_mode="HTML"
         )
     except Exception as e:
         logging.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
@@ -318,7 +320,7 @@ async def add_pill_time(message: Message, state: FSMContext):
         await state.clear()
         tz_label = get_tz_label(tz_name)
         await message.answer(
-            f"✅ Добавлено регулярное напоминание:\n💊 <b>{html.escape(pill_name)}</b>\n⏰ <b>{time_str}</b> ({tz_label})",
+            f"✅ Добавлено регулярное напоминание:\n💊 <b>{html_escape(pill_name)}</b>\n⏰ <b>{time_str}</b> ({tz_label})",
             reply_markup=get_main_menu(),
             parse_mode="HTML",
         )
@@ -342,8 +344,8 @@ async def list_reminders(message: Message):
     keyboard_rows = []
 
     for rem_id, pill_name, time_str in reminders:
-        lines.append(f"\n💊 <b>{html.escape(pill_name)}</b> — ⏰ {time_str}")
-        keyboard_rows.append([InlineKeyboardButton(text=f"🗑 {html.escape(pill_name)[:12]}", callback_data=f"del_{rem_id}")])
+        lines.append(f"\n💊 <b>{html_escape(pill_name)}</b> — ⏰ {time_str}")
+        keyboard_rows.append([InlineKeyboardButton(text=f"🗑 {html_escape(pill_name)[:12]}", callback_data=f"del_{rem_id}")])
 
     await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows), parse_mode="HTML")
 
