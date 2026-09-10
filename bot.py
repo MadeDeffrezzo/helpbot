@@ -703,8 +703,8 @@ async def handle_condition_choice(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(
             f"✅ Добавлено регулярное напоминание:\n💊 <b>{html_escape(pill_name)}</b>\n⏰ <b>{time_str}</b>\n🥗 <b>{html_escape(condition_label)}</b> ({tz_label})",
             parse_mode="HTML",
-            reply_markup=get_main_menu(),
         )
+        await callback.message.answer("Готово.", reply_markup=get_main_menu())
         return
 
     if action == "edit":
@@ -721,7 +721,8 @@ async def handle_condition_choice(callback: CallbackQuery, state: FSMContext):
             schedule_reminder(user_id, pill_name, time_str, edit_id, tz_name)
         await state.clear()
         await callback.answer()
-        await callback.message.edit_text(f"✅ Условие обновлено: <b>{html_escape(condition_label)}</b>", parse_mode="HTML", reply_markup=get_main_menu())
+        await callback.message.edit_text(f"✅ Условие обновлено: <b>{html_escape(condition_label)}</b>", parse_mode="HTML")
+        await callback.message.answer("Готово.", reply_markup=get_main_menu())
         return
 
     await callback.answer("⚠️ Неверный тип условия.", show_alert=True)
