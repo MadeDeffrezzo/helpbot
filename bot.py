@@ -48,6 +48,16 @@ RU_TIMEZONES = {
 
 
 # ================= БАЗА ДАННЫХ =================
+CONDITION_OPTIONS = {
+    "none": "не указано",
+    "before": "до еды",
+    "during": "во время еды",
+    "after": "после еды",
+    "empty": "натощак",
+    "night": "перед сном",
+}
+
+
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
@@ -64,10 +74,17 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
                 pill_name TEXT,
-                time_str TEXT
+                time_str TEXT,
+                condition TEXT DEFAULT 'не указано'
             )"""
         )
         conn.commit()
+
+        cursor.execute("PRAGMA table_info(reminders)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "condition" not in columns:
+            cursor.execute("ALTER TABLE reminders ADD COLUMN condition TEXT DEFAULT 'не указано'")
+            conn.commit()
 
 
 def set_user_tz(user_id, tz_name):
@@ -95,12 +112,12 @@ def get_tz_label(tz_name):
     return tz_name or "UTC"
 
 
-def add_reminder(user_id, pill_name, time_str):
+def add_reminder(user_id, pill_name, time_str, condition="не указано"):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO reminders (user_id, pill_name, time_str) VALUES (?, ?, ?)",
-            (user_id, pill_name, time_str),
+            "INSERT INTO reminders (user_id, pill_name, time_str, condition) VALUES (?, ?, ?, ?)",
+            (user_id, pill_name, time_str, condition),
         )
         conn.commit()
         return cursor.lastrowid
@@ -110,7 +127,7 @@ def get_user_reminders(user_id):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, pill_name, time_str FROM reminders WHERE user_id = ? ORDER BY time_str ASC",
+            "SELECT id, pill_name, time_str, condition FROM reminders WHERE user_id = ? ORDER BY time_str ASC",
             (user_id,),
         )
         return cursor.fetchall()
@@ -119,9 +136,30 @@ def get_user_reminders(user_id):
 def get_reminder_by_id(reminder_id):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id, pill_name, time_str FROM reminders WHERE id = ?", (reminder_id,))
+        cursor.execute("SELECT user_id, pill_name, time_str, condition FROM reminders WHERE id = ?", (reminder_id,))
         row = cursor.fetchone()
         return row if row else None
+
+
+def update_reminder(reminder_id, pill_name=None, time_str=None, condition=None):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        values = []
+        if pill_name is not None:
+            values.append(("pill_name", pill_name))
+        if time_str is not None:
+            values.append(("time_str", time_str))
+        if condition is not None:
+            values.append(("condition", condition))
+        if not values:
+            return False
+
+        assignments = ", ".join(f"{field} = ?" for field, _ in values)
+        params = [value for _, value in values]
+        params.append(reminder_id)
+        cursor.execute(f"UPDATE reminders SET {assignments} WHERE id = ?", params)
+        conn.commit()
+        return True
 
 
 def delete_reminder_db(reminder_id):
@@ -135,6 +173,13 @@ def delete_reminder_db(reminder_id):
 class Form(StatesGroup):
     waiting_for_pill_name = State()
     waiting_for_time = State()
+    waiting_for_condition = State()
+    waiting_for_new_name = State()
+    waiting_for_new_time = State()
+    waiting_for_new_condition = State()
+    waiting_for_calc_interval = State()
+    waiting_for_calc_amount = State()
+    waiting_for_calc_start = State()
 
 
 # ================= КЛАВИАТУРЫ =================
@@ -143,8 +188,27 @@ def get_main_menu():
         keyboard=[
             [KeyboardButton(text="💊 Добавить лекарство")],
             [KeyboardButton(text="📋 Мои лекарства"), KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="🧮 Калькулятор дозировки")],
         ],
         resize_keyboard=True,
+    )
+
+
+def get_condition_keyboard(prefix="add"):
+    rows = []
+    for key, label in CONDITION_OPTIONS.items():
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"cond_{prefix}_{key}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_edit_keyboard(reminder_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Название", callback_data=f"edit_name_{reminder_id}")],
+            [InlineKeyboardButton(text="⏰ Время", callback_data=f"edit_time_{reminder_id}")],
+            [InlineKeyboardButton(text="🥗 Условие", callback_data=f"edit_condition_{reminder_id}")],
+            [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_{reminder_id}")],
+        ]
     )
 
 
@@ -159,10 +223,13 @@ def get_tz_keyboard():
 async def send_pill_reminder(user_id: int, pill_name: str, reminder_id: int):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM reminders WHERE id = ?", (reminder_id,))
-        if not cursor.fetchone():
-            return 
+        cursor.execute("SELECT id, condition FROM reminders WHERE id = ?", (reminder_id,))
+        row = cursor.fetchone()
+        if not row:
+            return
+        _, condition = row
 
+    condition_text = CONDITION_OPTIONS.get(condition, "не указано") if condition else "не указано"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -173,7 +240,10 @@ async def send_pill_reminder(user_id: int, pill_name: str, reminder_id: int):
     )
     try:
         await bot.send_message(
-            user_id, f"🔔 Время принять лекарство: <b>{html_escape(pill_name)}</b>!", reply_markup=kb, parse_mode="HTML"
+            user_id,
+            f"🔔 Время принять лекарство: <b>{html_escape(pill_name)}</b>\n📌 Условие: <b>{html_escape(condition_text)}</b>",
+            reply_markup=kb,
+            parse_mode="HTML",
         )
     except Exception as e:
         logging.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
@@ -311,23 +381,69 @@ async def add_pill_time(message: Message, state: FSMContext):
             await state.clear()
             return
 
-        user_id = message.from_user.id
-        tz_name = get_user_tz(user_id)
+        await state.update_data(time_str=time_str)
+        await state.set_state(Form.waiting_for_condition)
+        await message.answer("Выберите, когда принимать лекарство:", reply_markup=get_condition_keyboard("add"))
+    except Exception:
+        logging.exception("Ошибка при подготовке условия для напоминания")
+        await state.clear()
+        await message.answer("⚠️ Не удалось подготовить напоминание. Попробуйте ещё раз с начала.")
 
-        rem_id = add_reminder(user_id, pill_name, time_str)
+
+@dp.callback_query(F.data.startswith("cond_"))
+async def handle_condition_choice(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    if len(parts) < 3:
+        await callback.answer("⚠️ Не удалось обработать условие.", show_alert=True)
+        return
+
+    action = parts[1]
+    condition_key = parts[2]
+    condition_value = CONDITION_OPTIONS.get(condition_key, "не указано")
+
+    if action == "add":
+        user_data = await state.get_data()
+        user_id = callback.from_user.id
+        tz_name = get_user_tz(user_id)
+        pill_name = str(user_data.get("pill_name", "")).strip()
+        time_str = str(user_data.get("time_str", "")).strip()
+
+        if not pill_name or not time_str:
+            await callback.message.edit_text("⚠️ Данные напоминания потеряны. Попробуйте добавить лекарство заново.")
+            await callback.answer()
+            return
+
+        rem_id = add_reminder(user_id, pill_name, time_str, condition_value)
         schedule_reminder(user_id, pill_name, time_str, rem_id, tz_name)
 
         await state.clear()
         tz_label = get_tz_label(tz_name)
-        await message.answer(
-            f"✅ Добавлено регулярное напоминание:\n💊 <b>{html_escape(pill_name)}</b>\n⏰ <b>{time_str}</b> ({tz_label})",
-            reply_markup=get_main_menu(),
+        await callback.message.edit_text(
+            f"✅ Добавлено регулярное напоминание:\n💊 <b>{html_escape(pill_name)}</b>\n⏰ <b>{time_str}</b>\n🥗 <b>{html_escape(condition_value)}</b> ({tz_label})",
             parse_mode="HTML",
+            reply_markup=get_main_menu(),
         )
-    except Exception as exc:
-        logging.exception("Ошибка при сохранении напоминания после ввода времени")
+        await callback.answer()
+        return
+
+    if action == "edit":
+        edit_id = await state.get_value("edit_reminder_id")
+        if edit_id is None:
+            await callback.message.edit_text("⚠️ Нет активного редактирования.")
+            await callback.answer()
+            return
+        update_reminder(edit_id, condition=condition_value)
+        reminder = get_reminder_by_id(edit_id)
+        if reminder:
+            user_id, pill_name, time_str, _ = reminder
+            tz_name = get_user_tz(user_id)
+            schedule_reminder(user_id, pill_name, time_str, edit_id, tz_name)
         await state.clear()
-        await message.answer("⚠️ Не удалось сохранить напоминание. Попробуйте ещё раз с начала.")
+        await callback.message.edit_text(f"✅ Условие обновлено: <b>{html_escape(condition_value)}</b>", parse_mode="HTML", reply_markup=get_main_menu())
+        await callback.answer()
+        return
+
+    await callback.answer("⚠️ Неверный тип условия.", show_alert=True)
 
 
 @dp.message(F.text == "📋 Мои лекарства")
@@ -339,15 +455,95 @@ async def list_reminders(message: Message):
 
     tz_name = get_user_tz(message.from_user.id)
     timezone_label = get_tz_label(tz_name)
-
     lines = [f"📋 <b>Ваш текущий график приема лекарств</b>", f"⏱️ Часовой пояс: {timezone_label}"]
-    keyboard_rows = []
 
-    for rem_id, pill_name, time_str in reminders:
-        lines.append(f"\n💊 <b>{html_escape(pill_name)}</b> — ⏰ {time_str}")
-        keyboard_rows.append([InlineKeyboardButton(text=f"🗑 {html_escape(pill_name)[:12]}", callback_data=f"del_{rem_id}")])
+    for rem_id, pill_name, time_str, condition in reminders:
+        lines.append(f"\n💊 <b>{html_escape(pill_name)}</b> — ⏰ {time_str} — 🥗 {html_escape(condition or 'не указано')}")
 
-    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows), parse_mode="HTML")
+    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"list_edit_{rem_id}")]
+        for rem_id, _, _, _ in reminders
+    ]), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("list_edit_"))
+async def list_edit_trigger(callback: CallbackQuery):
+    rem_id = int(callback.data.split("_", 2)[2])
+    reminder = get_reminder_by_id(rem_id)
+    if not reminder:
+        await callback.message.edit_text("⚠️ Напоминание не найдено.")
+        await callback.answer()
+        return
+
+    user_id, pill_name, time_str, condition = reminder
+    text = f"✏️ Что менять у лекарства <b>{html_escape(pill_name)}</b>?\n⏰ Сейчас: {time_str}\n🥗 Условие: {html_escape(condition or 'не указано')}"
+    await callback.message.edit_text(text, reply_markup=get_edit_keyboard(rem_id), parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("edit_name_"))
+async def edit_name_start(callback: CallbackQuery, state: FSMContext):
+    rem_id = int(callback.data.split("_", 2)[2])
+    await state.update_data(edit_reminder_id=rem_id)
+    await state.set_state(Form.waiting_for_new_name)
+    await callback.message.edit_text("Введите новое название лекарства:")
+    await callback.answer()
+
+
+@dp.message(Form.waiting_for_new_name)
+async def update_name(message: Message, state: FSMContext):
+    new_name = (message.text or "").strip()
+    if not new_name:
+        await message.answer("❌ Название не может быть пустым.")
+        return
+    data = await state.get_data()
+    rem_id = data.get("edit_reminder_id")
+    if rem_id is None:
+        await message.answer("❌ Нет активного редактирования.")
+        return
+    update_reminder(rem_id, pill_name=new_name)
+    await state.clear()
+    await message.answer(f"✅ Название обновлено на: <b>{html_escape(new_name)}</b>", parse_mode="HTML", reply_markup=get_main_menu())
+
+
+@dp.callback_query(F.data.startswith("edit_time_"))
+async def edit_time_start(callback: CallbackQuery, state: FSMContext):
+    rem_id = int(callback.data.split("_", 2)[2])
+    await state.update_data(edit_reminder_id=rem_id)
+    await state.set_state(Form.waiting_for_new_time)
+    await callback.message.edit_text("Введите новое время в формате ЧЧ:ММ:")
+    await callback.answer()
+
+
+@dp.message(Form.waiting_for_new_time)
+async def update_time(message: Message, state: FSMContext):
+    new_time = (message.text or "").strip()
+    try:
+        datetime.strptime(new_time, "%H:%M")
+    except ValueError:
+        await message.answer("❌ Некорректный формат времени. Пример: 08:30")
+        return
+    data = await state.get_data()
+    rem_id = data.get("edit_reminder_id")
+    if rem_id is None:
+        await message.answer("❌ Нет активного редактирования.")
+        return
+    update_reminder(rem_id, time_str=new_time)
+    reminder = get_reminder_by_id(rem_id)
+    if reminder:
+        user_id, pill_name, _, _ = reminder
+        tz_name = get_user_tz(user_id)
+        schedule_reminder(user_id, pill_name, new_time, rem_id, tz_name)
+    await state.clear()
+    await message.answer(f"✅ Время обновлено на: <b>{new_time}</b>", parse_mode="HTML", reply_markup=get_main_menu())
+
+
+@dp.callback_query(F.data.startswith("edit_condition_"))
+async def edit_condition_start(callback: CallbackQuery, state: FSMContext):
+    rem_id = int(callback.data.split("_", 2)[2])
+    await state.update_data(edit_reminder_id=rem_id)
+    await callback.message.edit_text("Выберите новое условие:", reply_markup=get_condition_keyboard("edit"))
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("del_"))
@@ -385,7 +581,7 @@ async def action_delay(callback: CallbackQuery):
         await callback.answer()
         return
 
-    user_id, pill_name, _ = data
+    user_id, pill_name, _, _ = data
     tz_name = get_user_tz(user_id)
     tz = pytz.timezone(tz_name) if tz_name else pytz.utc
     run_time = datetime.now(tz) + timedelta(minutes=10)
@@ -401,6 +597,75 @@ async def action_delay(callback: CallbackQuery):
 
     await callback.message.edit_text("⏰ График изменен. Бот повторно напомнит через 10 минут.")
     await callback.answer()
+
+
+@dp.message(F.text == "🧮 Калькулятор дозировки")
+async def dose_calculator_start(message: Message, state: FSMContext):
+    await state.set_state(Form.waiting_for_calc_interval)
+    await message.answer("Укажите интервал между приемами в часах (например: 8):")
+
+
+@dp.message(Form.waiting_for_calc_interval)
+async def dose_calculator_interval(message: Message, state: FSMContext):
+    try:
+        interval = float(message.text.strip())
+        if interval <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите корректное число часов, например 8 или 12.")
+        return
+    await state.update_data(interval=interval)
+    await state.set_state(Form.waiting_for_calc_amount)
+    await message.answer("Укажите дозировку в одной таблетке (например: 500):")
+
+
+@dp.message(Form.waiting_for_calc_amount)
+async def dose_calculator_amount(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите корректное число дозировки, например 500 или 1.")
+        return
+    data = await state.get_data()
+    interval = float(data.get("interval", 0))
+    await state.update_data(amount=amount)
+    await state.set_state(Form.waiting_for_calc_start)
+    await message.answer(
+        f"Укажите время первого приема в формате ЧЧ:ММ (например: 08:00).\n\n" \
+        f"Итог: прием каждые {interval} часов, по {amount} единиц(ы) за раз."
+    )
+
+
+@dp.message(Form.waiting_for_calc_start)
+async def dose_calculator_start_time(message: Message, state: FSMContext):
+    start_time = (message.text or "").strip()
+    try:
+        start_dt = datetime.strptime(start_time, "%H:%M")
+    except ValueError:
+        await message.answer("❌ Неверный формат времени. Пример: 08:00")
+        return
+
+    data = await state.get_data()
+    interval = float(data.get("interval", 0))
+    amount = float(data.get("amount", 0)) if "amount" in data else 0.0
+    if not interval or not amount:
+        await message.answer("❌ Данные калькулятора не найдены, запустите заново.")
+        await state.clear()
+        return
+
+    slots = []
+    for i in range(6):
+        dt = start_dt + timedelta(hours=interval * i)
+        slots.append(dt.strftime("%H:%M"))
+
+    lines = ["🧮 <b>Калькулятор дозировки</b>", f"📌 Дозировка: {amount}", f"⏱️ Интервал: каждые {interval} часов", "\nРекомендуемая схема:"]
+    for i, slot in enumerate(slots, 1):
+        lines.append(f"{i}. {slot}")
+
+    await state.clear()
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=get_main_menu())
 
 
 # ================= TOЧКА ВХОДА =================
