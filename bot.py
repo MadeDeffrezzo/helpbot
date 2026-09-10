@@ -86,6 +86,13 @@ def get_user_tz(user_id):
         return row[0] if row else None
 
 
+def get_tz_label(tz_name):
+    for key, (label, value) in RU_TIMEZONES.items():
+        if value == tz_name:
+            return label
+    return tz_name or "UTC"
+
+
 def add_reminder(user_id, pill_name, time_str):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
@@ -101,7 +108,7 @@ def get_user_reminders(user_id):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, pill_name, time_str FROM reminders WHERE user_id = ?",
+            "SELECT id, pill_name, time_str FROM reminders WHERE user_id = ? ORDER BY time_str ASC",
             (user_id,),
         )
         return cursor.fetchall()
@@ -172,6 +179,10 @@ async def send_pill_reminder(user_id: int, pill_name: str, reminder_id: int):
 
 def schedule_reminder(user_id, pill_name, time_str, reminder_id, tz_name):
     try:
+        if not tz_name:
+            logging.warning(f"Не удалось запланировать напоминание {reminder_id}: не задан часовой пояс пользователя {user_id}")
+            return
+
         user_tz = pytz.timezone(tz_name)
         now_user = datetime.now(user_tz)
 
@@ -186,13 +197,13 @@ def schedule_reminder(user_id, pill_name, time_str, reminder_id, tz_name):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
 
-        utc_datetime = job_datetime.astimezone(pytz.utc)
-
         scheduler.add_job(
             send_pill_reminder,
             "cron",
-            hour=utc_datetime.hour,
-            minute=utc_datetime.minute,
+            hour=job_datetime.hour,
+            minute=job_datetime.minute,
+            second=0,
+            timezone=user_tz,
             args=[user_id, pill_name, reminder_id],
             id=job_id,
             replace_existing=True,
@@ -203,6 +214,7 @@ def schedule_reminder(user_id, pill_name, time_str, reminder_id, tz_name):
 
 
 def restart_all_reminders():
+    rows = []
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -213,9 +225,15 @@ def restart_all_reminders():
         """
         )
         rows = cursor.fetchall()
-        for row in rows:
-            rem_id, u_id, name, t_str, tz = row
-            schedule_reminder(u_id, name, t_str, rem_id, tz)
+
+    try:
+        scheduler.remove_all_jobs()
+    except Exception as e:
+        logging.warning(f"Не удалось удалить старые job'ы перед восстановлением: {e}")
+
+    for row in rows:
+        rem_id, u_id, name, t_str, tz = row
+        schedule_reminder(u_id, name, t_str, rem_id, tz)
     logging.info(f"Успешно восстановлено задач из базы: {len(rows)}")
 
 
@@ -260,7 +278,12 @@ async def add_pill_start(message: Message, state: FSMContext):
 
 @dp.message(Form.waiting_for_pill_name)
 async def add_pill_name(message: Message, state: FSMContext):
-    await state.update_data(pill_name=message.text)
+    pill_name = message.text.strip()
+    if not pill_name:
+        await message.answer("❌ Название лекарства не может быть пустым. Введите корректное название.")
+        return
+
+    await state.update_data(pill_name=pill_name)
     await state.set_state(Form.waiting_for_time)
     await message.answer("Укажите время приема в формате **ЧЧ:ММ** (например: 08:00 или 22:45):")
 
@@ -275,7 +298,12 @@ async def add_pill_time(message: Message, state: FSMContext):
         return
 
     user_data = await state.get_data()
-    pill_name = user_data["pill_name"]
+    pill_name = user_data["pill_name"].strip()
+    if not pill_name:
+        await message.answer("❌ Название лекарства не распознано. Попробуйте добавить лекарство заново.")
+        await state.clear()
+        return
+
     user_id = message.from_user.id
     tz_name = get_user_tz(user_id)
 
@@ -283,7 +311,12 @@ async def add_pill_time(message: Message, state: FSMContext):
     schedule_reminder(user_id, pill_name, time_str, rem_id, tz_name)
 
     await state.clear()
-    await message.answer(f"✅ Добавлено регулярное напоминание:\n💊 <b>{html.escape(pill_name)}</b> в ⏰ <b>{time_str}</b>", reply_markup=get_main_menu(), parse_mode="HTML")
+    tz_label = get_tz_label(tz_name)
+    await message.answer(
+        f"✅ Добавлено регулярное напоминание:\n💊 <b>{html.escape(pill_name)}</b>\n⏰ <b>{time_str}</b> ({tz_label})",
+        reply_markup=get_main_menu(),
+        parse_mode="HTML",
+    )
 
 
 @dp.message(F.text == "📋 Мои лекарства")
@@ -293,12 +326,17 @@ async def list_reminders(message: Message):
         await message.answer("У вас пока нет активных напоминаний. Нажмите «💊 Добавить лекарство», чтобы создать первое.")
         return
 
-    await message.answer("📋 **Ваш текущий график приема лекарств:**")
+    tz_name = get_user_tz(message.from_user.id)
+    timezone_label = get_tz_label(tz_name)
+
+    lines = [f"📋 <b>Ваш текущий график приема лекарств</b>", f"⏱️ Часовой пояс: {timezone_label}"]
+    keyboard_rows = []
+
     for rem_id, pill_name, time_str in reminders:
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🗑 Удалить из базы", callback_data=f"del_{rem_id}")]]
-        )
-        await message.answer(f"💊 <b>{html.escape(pill_name)}</b>\n⏰ Время: {time_str}", reply_markup=kb, parse_mode="HTML")
+        lines.append(f"\n💊 <b>{html.escape(pill_name)}</b> — ⏰ {time_str}")
+        keyboard_rows.append([InlineKeyboardButton(text=f"🗑 {html.escape(pill_name)[:12]}", callback_data=f"del_{rem_id}")])
+
+    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows), parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("del_"))
@@ -330,16 +368,25 @@ async def action_done(callback: CallbackQuery):
 async def action_delay(callback: CallbackQuery):
     rem_id = int(callback.data.split("_")[1])
     data = get_reminder_by_id(rem_id)
-    
+
     if not data:
         await callback.message.edit_text("⚠️ Ошибка: Напоминание не найдено.")
         await callback.answer()
         return
-        
+
     user_id, pill_name, _ = data
-    run_time = datetime.now() + timedelta(minutes=10)
-    
-    scheduler.add_job(send_pill_reminder, "date", run_date=run_time, args=[user_id, pill_name, rem_id])
+    tz_name = get_user_tz(user_id)
+    tz = pytz.timezone(tz_name) if tz_name else pytz.utc
+    run_time = datetime.now(tz) + timedelta(minutes=10)
+
+    scheduler.add_job(
+        send_pill_reminder,
+        "date",
+        run_date=run_time,
+        args=[user_id, pill_name, rem_id],
+        id=f"delay_{rem_id}_{int(run_time.timestamp())}",
+        replace_existing=True,
+    )
 
     await callback.message.edit_text("⏰ График изменен. Бот повторно напомнит через 10 минут.")
     await callback.answer()
