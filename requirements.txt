@@ -1,3 +1,4 @@
 aiogram
-apscheduler
+apscheduler<4
 pytz
+python-dotenv
