@@ -1,4 +1,4 @@
-aiogram
-apscheduler<4
+aiogram>=3.0,<4
+apscheduler>=3.10,<4
 pytz
 python-dotenv

@@ -1,5 +1,6 @@
 .env
-pill_reminder.db
-tmp_*.db
+*.db
+*.db.bak
+data/
 __pycache__/
 *.pyc

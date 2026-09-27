@@ -1,7 +1,9 @@
 import asyncio
+import json
 import logging
 import os
 import random
+import shutil
 import sqlite3
 from datetime import datetime, timedelta
 from html import escape as html_escape
@@ -12,10 +14,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -24,6 +32,7 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 try:
@@ -36,11 +45,14 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Add it to environment variables or .env")
 
+# Путь к базе. На хостинге укажите путь на постоянном диске (volume), например /data/pill_reminder.db
 DB_NAME = os.getenv("DB_NAME", "pill_reminder.db")
+LEGACY_DB_NAME = "pill_reminder.db"  # где база лежала раньше — для автопереноса
 
-DELAY_MINUTES = 5          # «Напомнить через N минут»
+DELAY_OPTIONS = {15: "15 минут", 30: "30 минут", 60: "1 час"}  # кнопки «Напомнить позже»
 QUIZ_REPEAT_MINUTES = 1    # как часто повторять неподтверждённое напоминание
 QUIZ_MAX_ATTEMPTS = 30     # после скольких повторов перестать напоминать
+PENDING_MAX_AGE_HOURS = 12  # после перезапуска не досылать напоминания старше этого
 MAX_PILL_NAME_LEN = 100
 
 logging.basicConfig(level=logging.INFO)
@@ -48,7 +60,6 @@ if DefaultBotProperties:
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 else:
     bot = Bot(token=TOKEN, parse_mode="HTML")
-dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler(
     timezone=pytz.utc,
     job_defaults={"misfire_grace_time": 300, "coalesce": True},
@@ -92,8 +103,6 @@ SCHEDULE_MODES = {
     "interval": "Через равные интервалы",
 }
 
-PENDING_MATH_QUIZ = {}
-
 
 def get_condition_label(value):
     if value is None:
@@ -106,7 +115,34 @@ def get_condition_label(value):
     return "не указано"
 
 
+def prepare_db_file():
+    """Создаёт папку под базу и переносит (копирует) старую базу, если путь поменяли."""
+    db_path = os.path.abspath(DB_NAME)
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    if os.path.exists(db_path):
+        return
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (os.path.abspath(LEGACY_DB_NAME), os.path.join(script_dir, LEGACY_DB_NAME)):
+        if candidate != db_path and os.path.exists(candidate):
+            shutil.copy2(candidate, db_path)
+            logging.info(f"Старая база {candidate} скопирована в {db_path}")
+            return
+
+
+def backup_db():
+    """Копия базы рядом с ней (<база>.bak) на случай сбоя."""
+    if not os.path.exists(DB_NAME):
+        return
+    try:
+        with sqlite3.connect(DB_NAME) as src, sqlite3.connect(DB_NAME + ".bak") as dst:
+            src.backup(dst)
+    except sqlite3.Error:
+        logging.exception("Не удалось сделать резервную копию базы")
+
+
 def init_db():
+    prepare_db_file()
+    backup_db()
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -131,6 +167,28 @@ def init_db():
                 time_slots TEXT DEFAULT ''
             )"""
         )
+        # Неподтверждённые и отложенные напоминания — чтобы пережить перезапуск бота
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_reminders (
+                reminder_id INTEGER PRIMARY KEY,
+                user_id INTEGER,
+                kind TEXT,
+                answer INTEGER,
+                attempt INTEGER DEFAULT 0,
+                message_id INTEGER,
+                next_run TEXT
+            )"""
+        )
+        # Состояния диалогов (FSM)
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fsm_storage (
+                key TEXT PRIMARY KEY,
+                state TEXT,
+                data TEXT
+            )"""
+        )
         conn.commit()
 
         # Миграция старых баз: добавляем недостающие колонки, данные не трогаем
@@ -148,6 +206,13 @@ def init_db():
             if col_name not in columns:
                 cursor.execute(f"ALTER TABLE reminders ADD COLUMN {col_name} {column_def}")
         conn.commit()
+
+
+def log_db_stats():
+    with sqlite3.connect(DB_NAME) as conn:
+        users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        reminders = conn.execute("SELECT COUNT(*) FROM reminders").fetchone()[0]
+    logging.info(f"База: {os.path.abspath(DB_NAME)} — пользователей: {users}, напоминаний: {reminders}")
 
 
 def set_user_tz(user_id, tz_name):
@@ -298,6 +363,98 @@ def delete_reminder_db(reminder_id, user_id):
     return deleted
 
 
+# --- неподтверждённые / отложенные напоминания ---
+# kind: quiz — ждём ответа, будет повтор; expire — последний повтор, потом «не подтверждён»;
+#       delay — пользователь отложил напоминание
+def save_pending(reminder_id, user_id, kind, next_run, answer=None, attempt=0, message_id=None):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO pending_reminders
+                (reminder_id, user_id, kind, answer, attempt, message_id, next_run)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (reminder_id, user_id, kind, answer, attempt, message_id, next_run.isoformat()),
+        )
+        conn.commit()
+
+
+def get_pending(reminder_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM pending_reminders WHERE reminder_id = ?", (reminder_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_all_pending():
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in conn.execute("SELECT * FROM pending_reminders").fetchall()]
+
+
+def get_user_quizzes(user_id):
+    """[(reminder_id, правильный ответ)] для вопросов, на которые пользователь ещё не ответил."""
+    with sqlite3.connect(DB_NAME) as conn:
+        return conn.execute(
+            "SELECT reminder_id, answer FROM pending_reminders WHERE user_id = ? AND answer IS NOT NULL",
+            (user_id,),
+        ).fetchall()
+
+
+def delete_pending(reminder_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("DELETE FROM pending_reminders WHERE reminder_id = ?", (reminder_id,))
+        conn.commit()
+
+
+# ================= ХРАНИЛИЩЕ СОСТОЯНИЙ (FSM) =================
+class SQLiteStorage(BaseStorage):
+    """Состояния диалогов в SQLite: недописанное добавление лекарства переживает перезапуск."""
+
+    @staticmethod
+    def _key(key: StorageKey):
+        fields = ("bot_id", "chat_id", "user_id", "thread_id", "business_connection_id", "destiny")
+        return ":".join(str(getattr(key, field, "") or "") for field in fields)
+
+    def _read(self, key):
+        with sqlite3.connect(DB_NAME) as conn:
+            row = conn.execute("SELECT state, data FROM fsm_storage WHERE key = ?", (self._key(key),)).fetchone()
+        if not row:
+            return None, {}
+        return row[0], json.loads(row[1] or "{}")
+
+    def _write(self, key, state, data):
+        with sqlite3.connect(DB_NAME) as conn:
+            if state is None and not data:
+                conn.execute("DELETE FROM fsm_storage WHERE key = ?", (self._key(key),))
+            else:
+                conn.execute(
+                    "INSERT OR REPLACE INTO fsm_storage (key, state, data) VALUES (?, ?, ?)",
+                    (self._key(key), state, json.dumps(data, ensure_ascii=False)),
+                )
+            conn.commit()
+
+    async def set_state(self, key, state=None):
+        _, data = self._read(key)
+        self._write(key, state.state if isinstance(state, State) else state, data)
+
+    async def get_state(self, key):
+        return self._read(key)[0]
+
+    async def set_data(self, key, data):
+        state, _ = self._read(key)
+        self._write(key, state, dict(data))
+
+    async def get_data(self, key):
+        return self._read(key)[1]
+
+    async def close(self):
+        pass
+
+
+dp = Dispatcher(storage=SQLiteStorage())
+
+
 # ================= СОСТОЯНИЯ (FSM) =================
 class Form(StatesGroup):
     waiting_for_pill_name = State()
@@ -358,6 +515,18 @@ def get_edit_keyboard(reminder_id):
     )
 
 
+def get_reminder_keyboard(reminder_id, with_delay=True):
+    rows = [[InlineKeyboardButton(text="✅ Готово", callback_data=f"done_{reminder_id}")]]
+    if with_delay:
+        rows.append(
+            [
+                InlineKeyboardButton(text=f"⏰ {label}", callback_data=f"delay_{minutes}_{reminder_id}")
+                for minutes, label in DELAY_OPTIONS.items()
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def get_tz_keyboard():
     buttons = []
     for key, (label, _) in RU_TIMEZONES.items():
@@ -371,6 +540,31 @@ def parse_callback_id(data):
         return int(data.rsplit("_", 1)[1])
     except (IndexError, ValueError):
         return None
+
+
+# ================= ОТПРАВКА СООБЩЕНИЙ =================
+async def safe_edit(message, text, reply_markup=None):
+    """Редактирует сообщение, не падая на «message is not modified» и удалённых сообщениях."""
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        logging.debug(f"Не удалось изменить сообщение: {e}")
+
+
+async def safe_delete(chat_id, message_id):
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except TelegramAPIError as e:
+        logging.debug(f"Не удалось удалить сообщение {message_id}: {e}")
+
+
+async def send_with_retry(chat_id, text, reply_markup=None):
+    """Отправка с одним повтором, если Telegram попросил подождать (флуд-контроль)."""
+    try:
+        return await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        return await bot.send_message(chat_id, text, reply_markup=reply_markup)
 
 
 # ================= ПЛАНИРОВАНИЕ ЗАДАЧ =================
@@ -389,12 +583,18 @@ def normalize_schedule_reminder(reminder_id):
     time_str, schedule_mode, times_per_day, interval_hours, first_time, time_slots = row
     times = []
     mode = (schedule_mode or "slots").strip() or "slots"
-    count = int(times_per_day or 1)
+    try:
+        count = int(times_per_day or 1)
+        interval = float(interval_hours or 0)
+    except (TypeError, ValueError):
+        count, interval = 1, 0
     if mode == "interval":
         start_time = first_time or time_str
-        interval = float(interval_hours or 0)
-        if start_time and interval > 0:
-            start_dt = datetime.strptime(start_time, "%H:%M")
+        try:
+            start_dt = datetime.strptime(start_time, "%H:%M") if start_time else None
+        except ValueError:
+            start_dt = None
+        if start_dt and interval > 0:
             for i in range(count):
                 times.append((start_dt + timedelta(hours=interval * i)).strftime("%H:%M"))
         elif time_str:
@@ -412,70 +612,110 @@ def normalize_schedule_reminder(reminder_id):
     return list(dict.fromkeys(times))
 
 
+def cancel_pending_job(reminder_id):
+    try:
+        scheduler.remove_job(f"pending_{reminder_id}")
+    except JobLookupError:
+        pass
+
+
+def clear_pending(reminder_id):
+    """Останавливает повторы/отложенное напоминание и забывает вопрос."""
+    cancel_pending_job(reminder_id)
+    delete_pending(reminder_id)
+
+
+def schedule_pending_job(reminder_id, kind, run_date, attempt=0):
+    """Одна задача на напоминание: следующий повтор, финальная отметка или отложенный приём."""
+    if kind == "quiz":
+        func, args = send_smart_reminder, [reminder_id, attempt + 1]
+    elif kind == "expire":
+        func, args = expire_reminder, [reminder_id]
+    else:  # delay
+        func, args = send_smart_reminder, [reminder_id]
+    scheduler.add_job(
+        func,
+        "date",
+        run_date=run_date,
+        args=args,
+        id=f"pending_{reminder_id}",
+        replace_existing=True,
+    )
+
+
 def unschedule_reminder(reminder_id, include_pending=True):
     """Удаляет задачи напоминания. Точное сравнение префиксов, чтобы rem_1 не задевал rem_12."""
     for job in list(scheduler.get_jobs()):
-        job_id = job.id
-        if job_id.startswith(f"rem_{reminder_id}_"):
-            scheduler.remove_job(job_id)
-        elif include_pending and (job_id == f"quiz_{reminder_id}" or job_id.startswith(f"delay_{reminder_id}_")):
-            scheduler.remove_job(job_id)
+        if job.id.startswith(f"rem_{reminder_id}_"):
+            scheduler.remove_job(job.id)
     if include_pending:
-        PENDING_MATH_QUIZ.pop(reminder_id, None)
+        clear_pending(reminder_id)
 
 
-def stop_quiz(reminder_id):
-    PENDING_MATH_QUIZ.pop(reminder_id, None)
-    if scheduler.get_job(f"quiz_{reminder_id}"):
-        scheduler.remove_job(f"quiz_{reminder_id}")
+async def expire_reminder(reminder_id):
+    """Серия повторов закончилась без ответа: помечаем сообщение, оставляем только «Готово»."""
+    pending = get_pending(reminder_id)
+    clear_pending(reminder_id)
+    if not pending or not pending.get("message_id"):
+        return
+    reminder = get_reminder_by_id(reminder_id)
+    pill_name = html_escape(reminder[1]) if reminder else "лекарства"
+    try:
+        await bot.edit_message_text(
+            f"⚠️ Приём <b>{pill_name}</b> не подтверждён.\nЕсли вы уже приняли лекарство, нажмите «Готово».",
+            chat_id=pending["user_id"],
+            message_id=pending["message_id"],
+            reply_markup=get_reminder_keyboard(reminder_id, with_delay=False) if reminder else None,
+        )
+    except TelegramAPIError as e:
+        logging.debug(f"Не удалось пометить напоминание {reminder_id}: {e}")
 
 
 async def send_smart_reminder(reminder_id: int, attempt: int = 1):
     reminder = get_reminder_by_id(reminder_id)
     if not reminder:
-        stop_quiz(reminder_id)
+        clear_pending(reminder_id)
         return
     user_id, pill_name, _, condition = reminder
+
+    # старое сообщение с вопросом убираем, чтобы в чате было одно актуальное
+    previous = get_pending(reminder_id)
+    if previous and previous.get("message_id"):
+        await safe_delete(user_id, previous["message_id"])
 
     condition_text = get_condition_label(condition)
     a = random.randint(1, 5)
     b = random.randint(1, 5)
-    PENDING_MATH_QUIZ[reminder_id] = {"user_id": user_id, "pill_name": pill_name, "answer": a + b}
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Готово", callback_data=f"done_{reminder_id}")],
-            [InlineKeyboardButton(text=f"⏰ Напомнить через {DELAY_MINUTES} минут", callback_data=f"delay_{reminder_id}")],
-        ]
-    )
+    message_id = None
     try:
-        await bot.send_message(
+        sent = await send_with_retry(
             user_id,
             f"🔔 Время принять лекарство: <b>{html_escape(pill_name)}</b>\n"
             f"📌 Условие: <b>{html_escape(condition_text)}</b>\n\n"
             f"🧠 Быстрая проверка: <b>{a} + {b}</b> = ?\n"
-            "Напишите ответ цифрой, либо нажмите кнопку ниже.",
-            reply_markup=kb,
+            "Напишите ответ цифрой или нажмите «Готово». Отложить можно кнопками ниже.",
+            reply_markup=get_reminder_keyboard(reminder_id),
         )
+        message_id = sent.message_id
+    except TelegramForbiddenError:
+        # пользователь заблокировал бота — не повторяем; данные не трогаем
+        logging.warning(f"Пользователь {user_id} заблокировал бота, повторы напоминания {reminder_id} остановлены")
+        clear_pending(reminder_id)
+        return
     except Exception as e:
         logging.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
 
     # Повторяем, пока пользователь не подтвердит, но не бесконечно
-    if attempt < QUIZ_MAX_ATTEMPTS:
-        scheduler.add_job(
-            send_smart_reminder,
-            "date",
-            run_date=datetime.now(pytz.utc) + timedelta(minutes=QUIZ_REPEAT_MINUTES),
-            args=[reminder_id, attempt + 1],
-            id=f"quiz_{reminder_id}",
-            replace_existing=True,
-        )
-    else:
-        PENDING_MATH_QUIZ.pop(reminder_id, None)
+    next_run = datetime.now(pytz.utc) + timedelta(minutes=QUIZ_REPEAT_MINUTES)
+    kind = "quiz" if attempt < QUIZ_MAX_ATTEMPTS else "expire"
+    save_pending(reminder_id, user_id, kind, next_run, answer=a + b, attempt=attempt, message_id=message_id)
+    schedule_pending_job(reminder_id, kind, next_run, attempt)
 
 
 async def send_pill_reminder(reminder_id: int):
-    stop_quiz(reminder_id)  # новый приём сбрасывает старую серию повторов
+    # новый приём закрывает прошлую неподтверждённую серию
+    if get_pending(reminder_id):
+        await expire_reminder(reminder_id)
     await send_smart_reminder(reminder_id)
 
 
@@ -541,6 +781,25 @@ def restart_all_reminders():
     for rem_id, tz in rows:
         schedule_reminder(rem_id, tz)
     logging.info(f"Успешно восстановлено задач из базы: {len(rows)}")
+
+
+def restore_pending():
+    """После перезапуска продолжает повторы и отложенные напоминания."""
+    now = datetime.now(pytz.utc)
+    restored = 0
+    for row in get_all_pending():
+        rem_id = row["reminder_id"]
+        try:
+            run_date = datetime.fromisoformat(row["next_run"])
+        except (TypeError, ValueError):
+            delete_pending(rem_id)
+            continue
+        if not get_reminder_by_id(rem_id) or now - run_date > timedelta(hours=PENDING_MAX_AGE_HOURS):
+            delete_pending(rem_id)
+            continue
+        schedule_pending_job(rem_id, row["kind"], max(run_date, now + timedelta(seconds=5)), row["attempt"] or 0)
+        restored += 1
+    logging.info(f"Восстановлено неподтверждённых/отложенных напоминаний: {restored}")
 
 
 def apply_schedule_change(reminder_id, **fields):
@@ -636,7 +895,7 @@ async def select_timezone(callback: CallbackQuery):
     set_user_tz(user_id, tz_name)
     reschedule_user_reminders(user_id, tz_name)
 
-    await callback.message.edit_text(f"✅ Успешно установлен часовой пояс:\n<b>{label}</b>")
+    await safe_edit(callback.message, f"✅ Успешно установлен часовой пояс:\n<b>{label}</b>")
     await callback.message.answer(
         "Вы можете добавлять лекарства и настраивать график через меню ниже.", reply_markup=get_main_menu()
     )
@@ -842,37 +1101,54 @@ async def edit_schedule_mode(callback: CallbackQuery, state: FSMContext):
 async def action_done(callback: CallbackQuery):
     rem_id = parse_callback_id(callback.data)
     data = get_own_reminder(rem_id, callback.from_user.id) if rem_id else None
-    if rem_id:
-        stop_quiz(rem_id)
+    if data:
+        # останавливаем и повторы, и отложенное напоминание
+        pending = get_pending(rem_id)
+        clear_pending(rem_id)
+        if pending and pending.get("message_id") and pending["message_id"] != callback.message.message_id:
+            await safe_delete(callback.from_user.id, pending["message_id"])
 
     pill_label = f" «{html_escape(data[1])}»" if data else ""
     now_time = user_now(callback.from_user.id).strftime("%H:%M")
 
-    await callback.message.edit_text(f"✅ Вы подтвердили прием лекарства{pill_label} в {now_time}.")
+    await safe_edit(callback.message, f"✅ Вы подтвердили прием лекарства{pill_label} в {now_time}.")
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("delay_"))
 async def action_delay(callback: CallbackQuery):
+    # delay_<минуты>_<id>; старые кнопки из чата — delay_<id>
+    parts = callback.data.split("_")
     rem_id = parse_callback_id(callback.data)
+    minutes = next(iter(DELAY_OPTIONS))
+    if len(parts) == 3:
+        try:
+            minutes = int(parts[1])
+        except ValueError:
+            minutes = None
+    if minutes not in DELAY_OPTIONS:
+        await callback.answer("Эта кнопка устарела.", show_alert=True)
+        return
+
     data = get_own_reminder(rem_id, callback.from_user.id) if rem_id else None
     if not data:
-        await callback.message.edit_text("⚠️ Ошибка: Напоминание не найдено.")
+        await safe_edit(callback.message, "⚠️ Ошибка: Напоминание не найдено.")
         await callback.answer()
         return
 
-    stop_quiz(rem_id)
-    run_time = datetime.now(pytz.utc) + timedelta(minutes=DELAY_MINUTES)
-    scheduler.add_job(
-        send_smart_reminder,
-        "date",
-        run_date=run_time,
-        args=[rem_id],
-        id=f"delay_{rem_id}_{int(run_time.timestamp())}",
-        replace_existing=True,
-    )
+    pending = get_pending(rem_id)
+    if pending and pending.get("message_id") and pending["message_id"] != callback.message.message_id:
+        await safe_delete(callback.from_user.id, pending["message_id"])
 
-    await callback.message.edit_text(f"⏰ Напоминание будет повторено через {DELAY_MINUTES} минут.")
+    run_time = datetime.now(pytz.utc) + timedelta(minutes=minutes)
+    cancel_pending_job(rem_id)
+    save_pending(rem_id, callback.from_user.id, "delay", run_time)
+    schedule_pending_job(rem_id, "delay", run_time)
+
+    await safe_edit(
+        callback.message,
+        f"⏰ Напомню о <b>{html_escape(data[1])}</b> через {DELAY_OPTIONS[minutes]}.",
+    )
     await callback.answer()
 
 
@@ -881,9 +1157,9 @@ async def delete_reminder(callback: CallbackQuery, state: FSMContext):
     rem_id = parse_callback_id(callback.data)
     await state.clear()
     if rem_id and delete_reminder_db(rem_id, callback.from_user.id):
-        await callback.message.edit_text("❌ Напоминание полностью удалено из вашего графика.")
+        await safe_edit(callback.message, "❌ Напоминание полностью удалено из вашего графика.")
     else:
-        await callback.message.edit_text("⚠️ Напоминание не найдено.")
+        await safe_edit(callback.message, "⚠️ Напоминание не найдено.")
     await callback.answer()
 
 
@@ -1121,25 +1397,18 @@ async def handle_math_answer(message: Message):
     except ValueError:
         return
 
-    user_quizzes = [
-        (rem_id, payload)
-        for rem_id, payload in list(PENDING_MATH_QUIZ.items())
-        if payload.get("user_id") == message.from_user.id
-    ]
+    user_quizzes = get_user_quizzes(message.from_user.id)
     if not user_quizzes:
         return
 
-    for reminder_id, payload in user_quizzes:
-        if answer == payload.get("answer"):
-            stop_quiz(reminder_id)
+    for reminder_id, expected in user_quizzes:
+        if answer == expected:
+            clear_pending(reminder_id)
+            reminder = get_reminder_by_id(reminder_id)
+            pill_name = html_escape(reminder[1]) if reminder else "Лекарство"
             await message.answer(
-                f"✅ Верно! <b>{html_escape(payload['pill_name'])}</b> принят(а)?",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text="✅ Готово", callback_data=f"done_{reminder_id}")],
-                        [InlineKeyboardButton(text=f"⏰ Напомнить через {DELAY_MINUTES} минут", callback_data=f"delay_{reminder_id}")],
-                    ]
-                ),
+                f"✅ Верно! <b>{pill_name}</b> принят(а)?",
+                reply_markup=get_reminder_keyboard(reminder_id),
             )
             return
 
@@ -1149,9 +1418,14 @@ async def handle_math_answer(message: Message):
 # ================= TOЧКА ВХОДА =================
 async def main():
     init_db()
+    log_db_stats()
     scheduler.start()
     restart_all_reminders()
-    await dp.start_polling(bot)
+    restore_pending()
+    try:
+        await dp.start_polling(bot)
+    finally:
+        scheduler.shutdown(wait=False)
 
 
 if __name__ == "__main__":
