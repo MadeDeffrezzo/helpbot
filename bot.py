@@ -1,8 +1,11 @@
 import asyncio
+import csv
+import io
 import json
 import logging
 import os
 import random
+import re
 import shutil
 import sqlite3
 from datetime import datetime, timedelta
@@ -25,6 +28,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -55,6 +59,15 @@ QUIZ_MAX_ATTEMPTS = 30     # после скольких повторов пер
 PENDING_MAX_AGE_HOURS = 12  # после перезапуска не досылать напоминания старше этого
 MAX_PILL_NAME_LEN = 100
 
+BP_PAGE_SIZE = 10           # записей давления на странице истории
+BP_MAX_REMINDERS = 6        # сколько раз в день можно напоминать измерить давление
+BP_SYSTOLIC_RANGE = (50, 300)
+BP_DIASTOLIC_RANGE = (30, 200)
+BP_PULSE_RANGE = (25, 250)
+BP_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"  # время измерения в базе, всегда UTC
+# «120/80 70», «120/80/70», «120/80» — быстрая запись без кнопок
+BP_QUICK_PATTERN = r"^\s*\d{2,3}\s*/\s*\d{2,3}(\s*[\s,;/]\s*\d{2,3})?\s*$"
+
 logging.basicConfig(level=logging.INFO)
 if DefaultBotProperties:
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -84,8 +97,9 @@ BTN_ADD = "💊 Добавить лекарство"
 BTN_LIST = "📋 Мои лекарства"
 BTN_SETTINGS = "⚙️ Настройки"
 BTN_CALC = "🧮 Калькулятор дозировки"
+BTN_BP = "🩺 Давление и пульс"
 BTN_CANCEL = "❌ Отмена"
-MENU_BUTTONS = {BTN_ADD, BTN_LIST, BTN_SETTINGS, BTN_CALC, BTN_CANCEL}
+MENU_BUTTONS = {BTN_ADD, BTN_LIST, BTN_SETTINGS, BTN_CALC, BTN_BP, BTN_CANCEL}
 
 
 # ================= БАЗА ДАННЫХ =================
@@ -189,6 +203,30 @@ def init_db():
                 data TEXT
             )"""
         )
+        # Дневник давления и пульса (measured_at — UTC)
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bp_measurements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                systolic INTEGER NOT NULL,
+                diastolic INTEGER NOT NULL,
+                pulse INTEGER NOT NULL,
+                measured_at TEXT NOT NULL
+            )"""
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bp_measurements_user ON bp_measurements (user_id, measured_at)"
+        )
+        # Напоминания измерить давление: время через запятую и отложенное напоминание
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bp_reminders (
+                user_id INTEGER PRIMARY KEY,
+                time_slots TEXT DEFAULT '',
+                snooze_until TEXT
+            )"""
+        )
         conn.commit()
 
         # Миграция старых баз: добавляем недостающие колонки, данные не трогаем
@@ -212,7 +250,11 @@ def log_db_stats():
     with sqlite3.connect(DB_NAME) as conn:
         users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         reminders = conn.execute("SELECT COUNT(*) FROM reminders").fetchone()[0]
-    logging.info(f"База: {os.path.abspath(DB_NAME)} — пользователей: {users}, напоминаний: {reminders}")
+        measurements = conn.execute("SELECT COUNT(*) FROM bp_measurements").fetchone()[0]
+    logging.info(
+        f"База: {os.path.abspath(DB_NAME)} — пользователей: {users}, напоминаний: {reminders}, "
+        f"измерений давления: {measurements}"
+    )
 
 
 def set_user_tz(user_id, tz_name):
@@ -240,9 +282,13 @@ def get_tz_label(tz_name):
     return tz_name or "UTC"
 
 
-def user_now(user_id):
+def get_user_tzinfo(user_id):
     tz_name = get_user_tz(user_id)
-    return datetime.now(pytz.timezone(tz_name) if tz_name else pytz.utc)
+    return pytz.timezone(tz_name) if tz_name else pytz.utc
+
+
+def user_now(user_id):
+    return datetime.now(get_user_tzinfo(user_id))
 
 
 def add_reminder(
@@ -407,6 +453,148 @@ def delete_pending(reminder_id):
         conn.commit()
 
 
+# ================= ДАВЛЕНИЕ И ПУЛЬС =================
+# (верхнее от, нижнее от, значок, оценка, советовать врача) — по клиническим рекомендациям;
+# оценка берётся по худшему из двух чисел
+BP_LEVELS = [
+    (180, 110, "🔴", "очень высокое", True),
+    (160, 100, "🔴", "высокое", True),
+    (140, 90, "🟠", "повышенное", False),
+    (130, 85, "🟡", "высокое нормальное", False),
+    (120, 80, "🟢", "нормальное", False),
+]
+BP_EXAMPLE = "<b>120/80 70</b> (верхнее/нижнее давление и пульс)"
+
+
+def add_bp_measurement(user_id, systolic, diastolic, pulse):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.execute(
+            "INSERT INTO bp_measurements (user_id, systolic, diastolic, pulse, measured_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, systolic, diastolic, pulse, datetime.now(pytz.utc).strftime(BP_TIME_FORMAT)),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_bp_measurements(user_id, limit=-1, offset=0):
+    """[(верхнее, нижнее, пульс, время UTC)], новые первыми. limit=-1 — все записи."""
+    with sqlite3.connect(DB_NAME) as conn:
+        return conn.execute(
+            """
+            SELECT systolic, diastolic, pulse, measured_at FROM bp_measurements
+            WHERE user_id = ? ORDER BY measured_at DESC, id DESC LIMIT ? OFFSET ?
+            """,
+            (user_id, limit, offset),
+        ).fetchall()
+
+
+def count_bp_measurements(user_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        return conn.execute("SELECT COUNT(*) FROM bp_measurements WHERE user_id = ?", (user_id,)).fetchone()[0]
+
+
+def get_bp_average(user_id, days):
+    """(верхнее, нижнее, пульс, число измерений) в среднем за последние days дней."""
+    since = (datetime.now(pytz.utc) - timedelta(days=days)).strftime(BP_TIME_FORMAT)
+    with sqlite3.connect(DB_NAME) as conn:
+        return conn.execute(
+            """
+            SELECT AVG(systolic), AVG(diastolic), AVG(pulse), COUNT(*) FROM bp_measurements
+            WHERE user_id = ? AND measured_at >= ?
+            """,
+            (user_id, since),
+        ).fetchone()
+
+
+def get_bp_slots(user_id):
+    """Время напоминаний измерить давление, например ['08:00', '20:00']."""
+    with sqlite3.connect(DB_NAME) as conn:
+        row = conn.execute("SELECT time_slots FROM bp_reminders WHERE user_id = ?", (user_id,)).fetchone()
+    if not row:
+        return []
+    return parse_time_list(row[0]) or []
+
+
+def set_bp_slots(user_id, slots):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("INSERT OR IGNORE INTO bp_reminders (user_id) VALUES (?)", (user_id,))
+        conn.execute("UPDATE bp_reminders SET time_slots = ? WHERE user_id = ?", (", ".join(slots), user_id))
+        conn.commit()
+
+
+def set_bp_snooze(user_id, run_date):
+    """Запоминает отложенное напоминание о давлении; run_date=None — отложенного нет."""
+    with sqlite3.connect(DB_NAME) as conn:
+        if run_date:
+            conn.execute("INSERT OR IGNORE INTO bp_reminders (user_id) VALUES (?)", (user_id,))
+        conn.execute(
+            "UPDATE bp_reminders SET snooze_until = ? WHERE user_id = ?",
+            (run_date.isoformat() if run_date else None, user_id),
+        )
+        conn.commit()
+
+
+def parse_time_list(raw):
+    """Отсортированные времена ЧЧ:ММ из строки «8:00, 20:00»; None, если есть ошибка."""
+    slots = set()
+    for item in re.split(r"[,;\s]+", raw or ""):
+        if not item:
+            continue
+        try:
+            slots.add(datetime.strptime(item, "%H:%M").strftime("%H:%M"))
+        except ValueError:
+            return None
+    return sorted(slots)
+
+
+def parse_bp(text):
+    """((верхнее, нижнее, пульс), None) из «120/80 70» или (None, текст ошибки)."""
+    numbers = [int(n) for n in re.findall(r"\d+", text or "")]
+    if len(numbers) != 3:
+        return None, f"❌ Нужно три числа: верхнее давление, нижнее давление и пульс.\nНапример: {BP_EXAMPLE}"
+    systolic, diastolic, pulse = numbers
+    checks = (
+        (systolic, BP_SYSTOLIC_RANGE, "Верхнее давление"),
+        (diastolic, BP_DIASTOLIC_RANGE, "Нижнее давление"),
+        (pulse, BP_PULSE_RANGE, "Пульс"),
+    )
+    for value, (low, high), name in checks:
+        if not low <= value <= high:
+            return None, f"❌ {name} {value} — похоже на опечатку (ожидается от {low} до {high}). Проверьте показания."
+    if systolic <= diastolic:
+        return None, f"❌ Верхнее давление должно быть больше нижнего.\nНапример: {BP_EXAMPLE}"
+    return (systolic, diastolic, pulse), None
+
+
+def classify_bp(systolic, diastolic):
+    """(значок, оценка, советовать врача) для давления."""
+    for sys_min, dia_min, icon, label, warn in BP_LEVELS:
+        if systolic >= sys_min or diastolic >= dia_min:
+            return icon, label, warn
+    if systolic < 90 or diastolic < 60:
+        return "🔵", "пониженное", True
+    return "🟢", "оптимальное", False
+
+
+def classify_pulse(pulse):
+    """(значок, оценка) для пульса в покое."""
+    if pulse < 60:
+        return "🔵", "реже нормы"
+    if pulse > 90:
+        return "🟠", "чаще нормы"
+    return "🟢", "в норме"
+
+
+def bp_local_time(measured_at, tz):
+    return datetime.strptime(measured_at, BP_TIME_FORMAT).replace(tzinfo=pytz.utc).astimezone(tz)
+
+
+def format_bp_row(systolic, diastolic, pulse, measured_at, tz):
+    icon = classify_bp(systolic, diastolic)[0]
+    when = bp_local_time(measured_at, tz).strftime("%d.%m.%Y %H:%M")
+    return f"{icon} {when} — <b>{systolic}/{diastolic}</b>, пульс {pulse}"
+
+
 # ================= ХРАНИЛИЩЕ СОСТОЯНИЙ (FSM) =================
 class SQLiteStorage(BaseStorage):
     """Состояния диалогов в SQLite: недописанное добавление лекарства переживает перезапуск."""
@@ -469,6 +657,8 @@ class Form(StatesGroup):
     waiting_for_calc_interval = State()
     waiting_for_calc_amount = State()
     waiting_for_calc_start = State()
+    waiting_for_bp = State()
+    waiting_for_bp_times = State()
 
 
 # ================= КЛАВИАТУРЫ =================
@@ -477,6 +667,7 @@ def get_main_menu():
         keyboard=[
             [KeyboardButton(text=BTN_ADD)],
             [KeyboardButton(text=BTN_LIST), KeyboardButton(text=BTN_SETTINGS)],
+            [KeyboardButton(text=BTN_BP)],
             [KeyboardButton(text=BTN_CALC)],
         ],
         resize_keyboard=True,
@@ -525,6 +716,18 @@ def get_reminder_keyboard(reminder_id, with_delay=True):
             ]
         )
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_bp_reminder_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📝 Записать показания", callback_data="bp_add")],
+            [
+                InlineKeyboardButton(text=f"⏰ {label}", callback_data=f"bp_snooze_{minutes}")
+                for minutes, label in DELAY_OPTIONS.items()
+            ],
+        ]
+    )
 
 
 def get_tz_keyboard():
@@ -814,6 +1017,106 @@ def apply_schedule_change(reminder_id, **fields):
     return slots
 
 
+# --- напоминания измерить давление ---
+# bp_<user_id>_<n> — ежедневные, bp_snooze_<user_id> — отложенное кнопкой «⏰»
+async def send_bp_reminder(user_id: int):
+    clear_bp_snooze(user_id)  # напоминание пришло — отложенное больше не нужно
+    try:
+        await send_with_retry(
+            user_id,
+            "🩺 Время измерить давление и пульс.\n\n"
+            "Посидите спокойно 5 минут, затем измерьте и пришлите показания сообщением, "
+            f"например: {BP_EXAMPLE}",
+            reply_markup=get_bp_reminder_keyboard(),
+        )
+    except TelegramForbiddenError:
+        logging.warning(f"Пользователь {user_id} заблокировал бота, напоминание о давлении не отправлено")
+    except Exception as e:
+        logging.error(f"Не удалось отправить напоминание о давлении пользователю {user_id}: {e}")
+
+
+def schedule_bp_snooze(user_id, run_date):
+    scheduler.add_job(
+        send_bp_reminder,
+        "date",
+        run_date=run_date,
+        args=[user_id],
+        id=f"bp_snooze_{user_id}",
+        replace_existing=True,
+    )
+
+
+def clear_bp_snooze(user_id):
+    try:
+        scheduler.remove_job(f"bp_snooze_{user_id}")
+    except JobLookupError:
+        pass
+    set_bp_snooze(user_id, None)
+
+
+def unschedule_bp_reminders(user_id):
+    for job in list(scheduler.get_jobs()):
+        if job.id.startswith(f"bp_{user_id}_"):
+            scheduler.remove_job(job.id)
+
+
+def schedule_bp_reminders(user_id, tz_name):
+    """Ежедневные напоминания измерить давление. Возвращает запланированные времена."""
+    unschedule_bp_reminders(user_id)
+    slots = get_bp_slots(user_id)
+    if not slots or not tz_name:
+        return []
+    try:
+        user_tz = pytz.timezone(tz_name)
+        for idx, slot in enumerate(slots):
+            target_time = datetime.strptime(slot, "%H:%M").time()
+            scheduler.add_job(
+                send_bp_reminder,
+                "cron",
+                hour=target_time.hour,
+                minute=target_time.minute,
+                second=0,
+                timezone=user_tz,
+                args=[user_id],
+                id=f"bp_{user_id}_{idx}",
+                replace_existing=True,
+            )
+    except Exception:
+        logging.exception(f"Ошибка планирования напоминаний о давлении пользователя {user_id}")
+        unschedule_bp_reminders(user_id)
+        return []
+    return slots
+
+
+def restart_bp_reminders():
+    """После перезапуска: ежедневные и отложенные напоминания измерить давление."""
+    now = datetime.now(pytz.utc)
+    with sqlite3.connect(DB_NAME) as conn:
+        rows = conn.execute(
+            """
+            SELECT b.user_id, b.snooze_until, u.timezone
+            FROM bp_reminders b
+            LEFT JOIN users u ON b.user_id = u.user_id
+            """
+        ).fetchall()
+
+    scheduled = 0
+    for user_id, snooze_until, tz_name in rows:
+        if schedule_bp_reminders(user_id, tz_name):
+            scheduled += 1
+        if not snooze_until:
+            continue
+        try:
+            run_date = datetime.fromisoformat(snooze_until)
+        except ValueError:
+            run_date = None
+        if run_date and now - run_date <= timedelta(hours=PENDING_MAX_AGE_HOURS):
+            schedule_bp_snooze(user_id, max(run_date, now + timedelta(seconds=5)))
+        else:
+            set_bp_snooze(user_id, None)
+    logging.info(f"Восстановлено напоминаний о давлении: {scheduled}")
+
+
 # ================= ОБРАБОТЧИКИ: КОМАНДЫ И МЕНЮ =================
 # Кнопки меню зарегистрированы первыми, чтобы работать из любого состояния.
 @dp.message(CommandStart())
@@ -883,6 +1186,14 @@ async def dose_calculator_start(message: Message, state: FSMContext):
     await message.answer("Укажите интервал между приемами в часах (например: 8):", reply_markup=get_cancel_menu())
 
 
+@dp.message(Command("pressure"))
+@dp.message(F.text == BTN_BP)
+async def bp_menu(message: Message, state: FSMContext):
+    await state.clear()
+    text, keyboard = build_bp_menu(message.from_user.id)
+    await message.answer(text, reply_markup=keyboard)
+
+
 # ================= ОБРАБОТЧИКИ: КНОПКИ (CALLBACK) =================
 @dp.callback_query(F.data.startswith("zone_"))
 async def select_timezone(callback: CallbackQuery):
@@ -894,6 +1205,7 @@ async def select_timezone(callback: CallbackQuery):
     user_id = callback.from_user.id
     set_user_tz(user_id, tz_name)
     reschedule_user_reminders(user_id, tz_name)
+    schedule_bp_reminders(user_id, tz_name)
 
     await safe_edit(callback.message, f"✅ Успешно установлен часовой пояс:\n<b>{label}</b>")
     await callback.message.answer(
@@ -1163,6 +1475,175 @@ async def delete_reminder(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# --- давление и пульс ---
+BP_BACK_BUTTON = [InlineKeyboardButton(text="⬅️ Назад", callback_data="bp_menu")]
+
+
+def build_bp_menu(user_id):
+    lines = ["🩺 <b>Давление и пульс</b>", ""]
+    last = get_bp_measurements(user_id, 1)
+    if last:
+        lines.append("Последнее измерение:")
+        lines.append(format_bp_row(*last[0], get_user_tzinfo(user_id)))
+    else:
+        lines.append("Измерений пока нет.")
+    slots = get_bp_slots(user_id)
+    lines.append(f"🔔 Напоминания: {', '.join(slots) if slots else 'выключены'}")
+    lines.append(f"\nЧтобы записать показания, нажмите «📝 Записать» или просто отправьте сообщение: {BP_EXAMPLE}")
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📝 Записать измерение", callback_data="bp_add")],
+            [
+                InlineKeyboardButton(text="📖 История", callback_data="bp_hist_0"),
+                InlineKeyboardButton(text="🔔 Напоминания", callback_data="bp_rem"),
+            ],
+        ]
+    )
+    return "\n".join(lines), keyboard
+
+
+def build_bp_history(user_id, offset=0):
+    total = count_bp_measurements(user_id)
+    if not total:
+        return (
+            f"📖 Записей пока нет.\nОтправьте показания сообщением, например: {BP_EXAMPLE}",
+            InlineKeyboardMarkup(inline_keyboard=[BP_BACK_BUTTON]),
+        )
+
+    offset = max(0, min(offset, total - 1))
+    rows = get_bp_measurements(user_id, BP_PAGE_SIZE, offset)
+    tz = get_user_tzinfo(user_id)
+    lines = [f"📖 <b>Дневник давления</b> — записи {offset + 1}–{offset + len(rows)} из {total}", ""]
+    lines += [format_bp_row(*row, tz) for row in rows]
+    lines.append("")
+    for days in (7, 30):
+        avg_sys, avg_dia, avg_pulse, count = get_bp_average(user_id, days)
+        if count:
+            lines.append(
+                f"📊 В среднем за {days} дней: <b>{avg_sys:.0f}/{avg_dia:.0f}</b>, пульс {avg_pulse:.0f} ({count} изм.)"
+            )
+    lines.append("\n🟢 норма  🟡 высокое нормальное  🟠 повышенное  🔴 высокое  🔵 пониженное")
+
+    nav = []
+    if offset + BP_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton(text="⬅️ Раньше", callback_data=f"bp_hist_{offset + BP_PAGE_SIZE}"))
+    if offset > 0:
+        nav.append(InlineKeyboardButton(text="Позже ➡️", callback_data=f"bp_hist_{max(0, offset - BP_PAGE_SIZE)}"))
+    keyboard = [nav] if nav else []
+    keyboard.append([InlineKeyboardButton(text="📤 Скачать все записи", callback_data="bp_export")])
+    keyboard.append(BP_BACK_BUTTON)
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def build_bp_reminders(user_id):
+    slots = get_bp_slots(user_id)
+    lines = ["🔔 <b>Напоминания измерить давление</b>"]
+    if slots:
+        lines.append(f"Каждый день в: <b>{', '.join(slots)}</b>")
+        lines.append(f"⏱️ Часовой пояс: {get_tz_label(get_user_tz(user_id))}")
+    else:
+        lines.append("Сейчас выключены.")
+    rows = [[InlineKeyboardButton(text="🕐 Задать время", callback_data="bp_rem_set")]]
+    if slots:
+        rows.append([InlineKeyboardButton(text="🔕 Выключить", callback_data="bp_rem_off")])
+    rows.append(BP_BACK_BUTTON)
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "bp_menu")
+async def bp_menu_callback(callback: CallbackQuery):
+    text, keyboard = build_bp_menu(callback.from_user.id)
+    await safe_edit(callback.message, text, keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "bp_add")
+async def bp_add_start(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(Form.waiting_for_bp)
+    await safe_edit(callback.message, f"📝 Введите показания тонометра, например: {BP_EXAMPLE}")
+    await callback.message.answer("Или нажмите «Отмена».", reply_markup=get_cancel_menu())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("bp_hist_"))
+async def bp_history(callback: CallbackQuery):
+    offset = parse_callback_id(callback.data) or 0
+    text, keyboard = build_bp_history(callback.from_user.id, offset)
+    await safe_edit(callback.message, text, keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "bp_export")
+async def bp_export(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    rows = get_bp_measurements(user_id)
+    if not rows:
+        await callback.answer("Записей пока нет.", show_alert=True)
+        return
+    await callback.answer()
+
+    tz = get_user_tzinfo(user_id)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, delimiter=";")  # «;» — чтобы русский Excel сразу разложил по столбцам
+    writer.writerow(["Дата", "Время", "Верхнее", "Нижнее", "Пульс"])
+    for systolic, diastolic, pulse, measured_at in reversed(rows):
+        local = bp_local_time(measured_at, tz)
+        writer.writerow([local.strftime("%d.%m.%Y"), local.strftime("%H:%M"), systolic, diastolic, pulse])
+    filename = f"davlenie_{datetime.now(tz):%Y-%m-%d}.csv"
+    await callback.message.answer_document(
+        BufferedInputFile(buffer.getvalue().encode("utf-8-sig"), filename=filename),
+        caption=f"📤 Все ваши измерения давления и пульса ({len(rows)}). Файл открывается в Excel.",
+    )
+
+
+@dp.callback_query(F.data == "bp_rem")
+async def bp_reminders_menu(callback: CallbackQuery):
+    text, keyboard = build_bp_reminders(callback.from_user.id)
+    await safe_edit(callback.message, text, keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "bp_rem_set")
+async def bp_reminders_set_start(callback: CallbackQuery, state: FSMContext):
+    if not get_user_tz(callback.from_user.id):
+        await callback.answer("⚠️ Сначала укажите часовой пояс в разделе ⚙️ Настройки", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(Form.waiting_for_bp_times)
+    await safe_edit(
+        callback.message,
+        f"Во сколько напоминать измерить давление? Введите от 1 до {BP_MAX_REMINDERS} времён через запятую.\n"
+        "Например: <b>08:00, 20:00</b>",
+    )
+    await callback.message.answer("Или нажмите «Отмена».", reply_markup=get_cancel_menu())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "bp_rem_off")
+async def bp_reminders_off(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    set_bp_slots(user_id, [])
+    unschedule_bp_reminders(user_id)
+    clear_bp_snooze(user_id)
+    text, keyboard = build_bp_reminders(user_id)
+    await safe_edit(callback.message, text, keyboard)
+    await callback.answer("Напоминания выключены")
+
+
+@dp.callback_query(F.data.startswith("bp_snooze_"))
+async def bp_snooze(callback: CallbackQuery):
+    minutes = parse_callback_id(callback.data)
+    if minutes not in DELAY_OPTIONS:
+        await callback.answer("Эта кнопка устарела.", show_alert=True)
+        return
+    run_time = datetime.now(pytz.utc) + timedelta(minutes=minutes)
+    set_bp_snooze(callback.from_user.id, run_time)
+    schedule_bp_snooze(callback.from_user.id, run_time)
+    await safe_edit(callback.message, f"⏰ Напомню измерить давление через {DELAY_OPTIONS[minutes]}.")
+    await callback.answer()
+
+
 # ================= ОБРАБОТЧИКИ: ВВОД ТЕКСТА ПО СОСТОЯНИЯМ =================
 @dp.message(Form.waiting_for_pill_name)
 async def add_pill_name(message: Message, state: FSMContext):
@@ -1389,6 +1870,69 @@ async def dose_calculator_start_time(message: Message, state: FSMContext):
     await message.answer("\n".join(lines), reply_markup=get_main_menu())
 
 
+async def save_bp_measurement(message: Message, state: FSMContext):
+    """Разбирает показания из сообщения, сохраняет и показывает оценку."""
+    values, error = parse_bp(message.text)
+    if error:
+        await message.answer(error)
+        return
+    await state.clear()
+    user_id = message.from_user.id
+    systolic, diastolic, pulse = values
+    add_bp_measurement(user_id, systolic, diastolic, pulse)
+    clear_bp_snooze(user_id)  # уже измерили — отложенное напоминание не нужно
+
+    bp_icon, bp_label, warn = classify_bp(systolic, diastolic)
+    pulse_icon, pulse_label = classify_pulse(pulse)
+    lines = [
+        f"✅ Записано: <b>{systolic}/{diastolic}</b>, пульс <b>{pulse}</b>",
+        f"🕒 {user_now(user_id):%d.%m.%Y %H:%M}",
+        "",
+        f"{bp_icon} Давление: {bp_label}",
+        f"{pulse_icon} Пульс: {pulse_label}",
+    ]
+    if warn:
+        lines.append("\n⚠️ Если самочувствие плохое, обратитесь к врачу.")
+    await message.answer("\n".join(lines), reply_markup=get_main_menu())
+
+
+@dp.message(Form.waiting_for_bp)
+async def bp_input(message: Message, state: FSMContext):
+    await save_bp_measurement(message, state)
+
+
+@dp.message(Form.waiting_for_bp_times)
+async def bp_reminders_set(message: Message, state: FSMContext):
+    slots = parse_time_list(message.text)
+    if not slots or len(slots) > BP_MAX_REMINDERS:
+        await message.answer(
+            f"❌ Введите от 1 до {BP_MAX_REMINDERS} времён в формате ЧЧ:ММ через запятую, например: 08:00, 20:00"
+        )
+        return
+
+    user_id = message.from_user.id
+    await state.clear()
+    set_bp_slots(user_id, slots)
+    tz_name = get_user_tz(user_id)
+    if not schedule_bp_reminders(user_id, tz_name):
+        await message.answer(
+            "⚠️ Не удалось включить напоминания. Проверьте часовой пояс в разделе ⚙️ Настройки.",
+            reply_markup=get_main_menu(),
+        )
+        return
+    await message.answer(
+        f"✅ Буду напоминать измерить давление и пульс каждый день в <b>{', '.join(slots)}</b>\n"
+        f"🕒 {get_tz_label(tz_name)}",
+        reply_markup=get_main_menu(),
+    )
+
+
+# ================= БЫСТРАЯ ЗАПИСЬ ДАВЛЕНИЯ «120/80 70» (только вне состояний) =================
+@dp.message(StateFilter(None), F.text.regexp(BP_QUICK_PATTERN))
+async def bp_quick_input(message: Message, state: FSMContext):
+    await save_bp_measurement(message, state)
+
+
 # ================= ОТВЕТ НА ПРОВЕРКУ (последним, только вне состояний) =================
 @dp.message(StateFilter(None), F.text)
 async def handle_math_answer(message: Message):
@@ -1420,8 +1964,9 @@ async def main():
     init_db()
     log_db_stats()
     scheduler.start()
-    restart_all_reminders()
+    restart_all_reminders()  # удаляет все задачи, поэтому давление — после него
     restore_pending()
+    restart_bp_reminders()
     try:
         await dp.start_polling(bot)
     finally:
